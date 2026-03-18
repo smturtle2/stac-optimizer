@@ -205,5 +205,3 @@ The tag workflow then:
 Project maintainers must register this repository and
 `.github/workflows/workflow.yml` as a Trusted Publisher on PyPI for the publish
 step to succeed.
-
-See [CHANGELOG.md](CHANGELOG.md) for released versions only.

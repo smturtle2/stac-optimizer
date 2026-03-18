@@ -22,7 +22,6 @@ classifiers = [
 Homepage = "https://github.com/smturtle2/stac-optimizer"
 Repository = "https://github.com/smturtle2/stac-optimizer"
 Issues = "https://github.com/smturtle2/stac-optimizer/issues"
-Changelog = "https://github.com/smturtle2/stac-optimizer/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
