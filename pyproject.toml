@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=77", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stac-optimizer"
+dynamic = ["version"]
+description = "STAC optimizer with a signSGD trunk and an AdamW cap for the last N trainable layers."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.10"]
+keywords = ["pytorch", "optimizer", "signsgd", "adamw"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8.3",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools_scm]
+fallback_version = "0.1.0.dev0"
+local_scheme = "no-local-version"
+version_scheme = "guess-next-dev"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
