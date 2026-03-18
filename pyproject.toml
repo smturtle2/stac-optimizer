@@ -7,19 +7,28 @@ name = "stac-optimizer"
 dynamic = ["version"]
 description = "STAC optimizer with a signSGD trunk and an AdamW cap for the last N trainable layers."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 dependencies = ["torch>=2.10"]
 keywords = ["pytorch", "optimizer", "signsgd", "adamw"]
 classifiers = [
+  "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+
+[project.urls]
+Homepage = "https://github.com/smturtle2/stac-optimizer"
+Repository = "https://github.com/smturtle2/stac-optimizer"
+Issues = "https://github.com/smturtle2/stac-optimizer/issues"
+Changelog = "https://github.com/smturtle2/stac-optimizer/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
   "pytest>=8.3",
+  "twine>=6.1",
 ]
 
 [tool.setuptools]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -98,7 +99,10 @@ class STAC(Optimizer):
     Layer discovery is deterministic: STAC walks ``model.named_modules()`` in
     registration order and treats each module that owns trainable parameters
     directly (``recurse=False``) as one layer. The final ``last_n_layers`` of
-    that ordered list use AdamW, while all earlier layers use signSGD.
+    that ordered list use AdamW, while all earlier layers use a sign-based
+    trunk update. By default the trunk accumulates gradients with momentum
+    before taking the sign, which is markedly more stable than plain signSGD.
+    Set ``trunk_momentum=0.0`` to recover textbook signSGD.
     """
 
     def __init__(
@@ -106,23 +110,44 @@ class STAC(Optimizer):
         model: nn.Module,
         *,
         lr: float = 1e-3,
+        trunk_lr: float | None = None,
+        cap_lr: float | None = None,
         last_n_layers: int = 1,
+        trunk_momentum: float = 0.9,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
+        trunk_weight_decay: float | None = None,
+        cap_weight_decay: float | None = None,
         maximize: bool = False,
+        error_if_nonfinite: bool = False,
     ) -> None:
-        if lr < 0.0:
-            raise ValueError(f"Invalid learning rate: {lr}.")
-        if eps < 0.0:
-            raise ValueError(f"Invalid epsilon value: {eps}.")
-        if weight_decay < 0.0:
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}.")
+        self._validate_nonnegative("lr", lr)
+        self._validate_nonnegative("eps", eps)
+        self._validate_nonnegative("weight_decay", weight_decay)
         beta1, beta2 = betas
         if not 0.0 <= beta1 < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {beta1}.")
         if not 0.0 <= beta2 < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {beta2}.")
+        if not 0.0 <= trunk_momentum < 1.0:
+            raise ValueError(
+                f"Invalid trunk_momentum value: {trunk_momentum}."
+            )
+
+        trunk_lr = lr if trunk_lr is None else trunk_lr
+        cap_lr = lr if cap_lr is None else cap_lr
+        trunk_weight_decay = (
+            weight_decay if trunk_weight_decay is None else trunk_weight_decay
+        )
+        cap_weight_decay = (
+            weight_decay if cap_weight_decay is None else cap_weight_decay
+        )
+
+        self._validate_nonnegative("trunk_lr", trunk_lr)
+        self._validate_nonnegative("cap_lr", cap_lr)
+        self._validate_nonnegative("trunk_weight_decay", trunk_weight_decay)
+        self._validate_nonnegative("cap_weight_decay", cap_weight_decay)
 
         self.partition = partition_trainable_layers(
             model,
@@ -137,6 +162,9 @@ class STAC(Optimizer):
                     "params": list(self.partition.trunk_parameters),
                     "stac_role": "trunk",
                     "layer_names": self.partition.trunk_layer_names,
+                    "lr": trunk_lr,
+                    "weight_decay": trunk_weight_decay,
+                    "trunk_momentum": trunk_momentum,
                 }
             )
         if self.partition.cap_layers:
@@ -145,17 +173,44 @@ class STAC(Optimizer):
                     "params": list(self.partition.cap_parameters),
                     "stac_role": "cap",
                     "layer_names": self.partition.cap_layer_names,
+                    "lr": cap_lr,
+                    "weight_decay": cap_weight_decay,
                 }
             )
 
         defaults = {
             "lr": lr,
+            "trunk_lr": trunk_lr,
+            "cap_lr": cap_lr,
+            "trunk_momentum": trunk_momentum,
             "betas": betas,
             "eps": eps,
             "weight_decay": weight_decay,
+            "trunk_weight_decay": trunk_weight_decay,
+            "cap_weight_decay": cap_weight_decay,
             "maximize": maximize,
+            "error_if_nonfinite": error_if_nonfinite,
         }
-        super().__init__(param_groups, defaults)
+        self._initializing = True
+        try:
+            super().__init__(param_groups, defaults)
+        finally:
+            self._initializing = False
+
+    @staticmethod
+    def _validate_nonnegative(name: str, value: float) -> None:
+        if value < 0.0:
+            raise ValueError(f"Invalid {name}: {value}.")
+
+    def add_param_group(self, param_group: dict[str, object]) -> None:
+        if getattr(self, "_initializing", False):
+            super().add_param_group(param_group)
+            return
+
+        raise RuntimeError(
+            "STAC does not support add_param_group(); construct a new optimizer "
+            "so the trunk/cap partition stays deterministic."
+        )
 
     def __setstate__(self, state: dict[str, object]) -> None:
         super().__setstate__(state)
@@ -163,9 +218,11 @@ class STAC(Optimizer):
             group.setdefault("maximize", False)
             group.setdefault("stac_role", "trunk")
             group.setdefault("layer_names", ())
+            group.setdefault("trunk_momentum", 0.0)
+            group.setdefault("error_if_nonfinite", False)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure: Callable[[], torch.Tensor] | None = None):
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -187,6 +244,8 @@ class STAC(Optimizer):
         lr = float(group["lr"])
         weight_decay = float(group["weight_decay"])
         maximize = bool(group["maximize"])
+        trunk_momentum = float(group["trunk_momentum"])
+        error_if_nonfinite = bool(group["error_if_nonfinite"])
 
         for parameter in group["params"]:
             gradient = parameter.grad
@@ -196,9 +255,27 @@ class STAC(Optimizer):
                 raise RuntimeError("STAC does not support sparse gradients.")
 
             update = -gradient if maximize else gradient
+            self._assert_finite(update, error_if_nonfinite, role="trunk")
             if weight_decay != 0:
                 parameter.mul_(1 - lr * weight_decay)
-            parameter.add_(update.sign(), alpha=-lr)
+
+            if trunk_momentum != 0.0:
+                state = self.state[parameter]
+                momentum_buffer = state.get("trunk_momentum_buffer")
+                if momentum_buffer is None:
+                    momentum_buffer = state["trunk_momentum_buffer"] = torch.zeros_like(
+                        parameter,
+                        memory_format=torch.preserve_format,
+                    )
+                momentum_buffer.mul_(trunk_momentum).add_(
+                    update,
+                    alpha=1 - trunk_momentum,
+                )
+                direction = momentum_buffer.sign()
+            else:
+                direction = update.sign()
+
+            parameter.add_(direction, alpha=-lr)
 
     def _step_adamw(self, group: dict[str, object]) -> None:
         lr = float(group["lr"])
@@ -206,6 +283,7 @@ class STAC(Optimizer):
         eps = float(group["eps"])
         weight_decay = float(group["weight_decay"])
         maximize = bool(group["maximize"])
+        error_if_nonfinite = bool(group["error_if_nonfinite"])
 
         for parameter in group["params"]:
             gradient = parameter.grad
@@ -215,6 +293,7 @@ class STAC(Optimizer):
                 raise RuntimeError("AdamW cap does not support sparse gradients.")
 
             update = -gradient if maximize else gradient
+            self._assert_finite(update, error_if_nonfinite, role="cap")
             state = self.state[parameter]
             if not state:
                 state["step"] = 0
@@ -244,3 +323,15 @@ class STAC(Optimizer):
             denom = exp_avg_sq.sqrt().div(math.sqrt(bias_correction2)).add_(eps)
             step_size = lr / bias_correction1
             parameter.addcdiv_(exp_avg, denom, value=-step_size)
+
+    @staticmethod
+    def _assert_finite(
+        gradient: torch.Tensor,
+        error_if_nonfinite: bool,
+        *,
+        role: str,
+    ) -> None:
+        if error_if_nonfinite and not torch.isfinite(gradient).all():
+            raise RuntimeError(
+                f"Encountered non-finite gradients in the STAC {role}."
+            )

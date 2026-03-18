@@ -34,9 +34,52 @@ jobs:
       - name: Run tests
         run: python -m pytest
 
+  package:
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install packaging dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cpu "torch>=2.10"
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Validate package metadata
+        run: python -m twine check dist/*
+
+      - name: Smoke test built wheel
+        run: |
+          python -m pip install --force-reinstall --no-deps dist/*.whl
+          python - <<'PY'
+          from torch import nn
+          from stac_optimizer import STAC
+
+          model = nn.Sequential(
+              nn.Linear(4, 4),
+              nn.ReLU(),
+              nn.Linear(4, 2),
+          )
+          optimizer = STAC(model, last_n_layers=1)
+          assert optimizer.partition.cap_layer_names == ("2",)
+          PY
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: test
+    needs: [test, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -55,7 +98,7 @@ jobs:
       - name: Install build tooling
         run: |
           python -m pip install --upgrade pip
-          python -m pip install build setuptools-scm
+          python -m pip install build setuptools-scm twine
 
       - name: Verify tag matches package version
         env:
@@ -77,6 +120,9 @@ jobs:
 
       - name: Build distributions
         run: python -m build
+
+      - name: Validate package metadata
+        run: python -m twine check dist/*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

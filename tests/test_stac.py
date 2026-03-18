@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import math
 
 import pytest
@@ -26,6 +27,17 @@ class TwoLayerNet(nn.Module):
         super().__init__()
         self.trunk = nn.Linear(1, 1, bias=False)
         self.head = nn.Linear(1, 1, bias=False)
+
+
+class SparseNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(8, 4, sparse=True)
+        self.head = nn.Linear(4, 1, bias=False)
+
+    def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        embedded = self.embedding(indices).sum(dim=1)
+        return self.head(embedded)
 
 
 def test_partition_defaults_to_last_trainable_layer() -> None:
@@ -85,7 +97,16 @@ def test_negative_last_n_layers_is_rejected() -> None:
         STAC(model, last_n_layers=-1)
 
 
-def test_trunk_uses_signsgd_while_cap_matches_adamw() -> None:
+def test_requires_at_least_one_trainable_parameter() -> None:
+    model = StackedNet()
+    for parameter in model.parameters():
+        parameter.requires_grad = False
+
+    with pytest.raises(ValueError, match="at least one trainable parameter"):
+        STAC(model)
+
+
+def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
     model = TwoLayerNet()
     with torch.no_grad():
         model.trunk.weight.fill_(1.0)
@@ -95,6 +116,7 @@ def test_trunk_uses_signsgd_while_cap_matches_adamw() -> None:
         model,
         lr=0.1,
         last_n_layers=1,
+        trunk_momentum=0.0,
         betas=(0.9, 0.99),
         eps=1e-8,
         weight_decay=0.01,
@@ -134,3 +156,172 @@ def test_trunk_uses_signsgd_while_cap_matches_adamw() -> None:
         reference_parameter.detach(),
         atol=1e-6,
     )
+
+
+def test_trunk_momentum_uses_sign_of_accumulated_gradient() -> None:
+    model = TwoLayerNet()
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_layers=1,
+        trunk_momentum=0.5,
+        weight_decay=0.01,
+    )
+
+    model.trunk.weight.grad = torch.tensor([[1.0]])
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+    model.trunk.weight.grad = torch.tensor([[-0.1]])
+    optimizer.step()
+
+    expected = 1.0
+    expected *= 1 - 0.1 * 0.01
+    expected -= 0.1
+    expected *= 1 - 0.1 * 0.01
+    expected -= 0.1
+
+    assert torch.allclose(
+        model.trunk.weight.detach(),
+        torch.tensor([[expected]]),
+        atol=1e-6,
+    )
+
+
+def test_role_specific_learning_rates_are_applied() -> None:
+    model = TwoLayerNet()
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+        model.head.weight.fill_(1.0)
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        trunk_lr=0.2,
+        cap_lr=0.05,
+        last_n_layers=1,
+        trunk_momentum=0.0,
+    )
+
+    reference_parameter = nn.Parameter(torch.tensor([[1.0]]))
+    reference_optimizer = torch.optim.AdamW(
+        [reference_parameter],
+        lr=0.05,
+        weight_decay=0.0,
+    )
+
+    model.trunk.weight.grad = torch.tensor([[1.0]])
+    model.head.weight.grad = torch.tensor([[1.0]])
+    reference_parameter.grad = torch.tensor([[1.0]])
+
+    optimizer.step()
+    reference_optimizer.step()
+
+    assert torch.allclose(
+        model.trunk.weight.detach(),
+        torch.tensor([[0.8]]),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.head.weight.detach(),
+        reference_parameter.detach(),
+        atol=1e-6,
+    )
+
+
+def test_state_dict_round_trip_preserves_optimizer_behavior() -> None:
+    torch.manual_seed(0)
+    model_a = TwoLayerNet()
+    torch.manual_seed(0)
+    model_b = TwoLayerNet()
+
+    optimizer_a = STAC(
+        model_a,
+        lr=0.1,
+        last_n_layers=1,
+        trunk_momentum=0.8,
+        betas=(0.7, 0.9),
+        weight_decay=0.01,
+    )
+    optimizer_b = STAC(
+        model_b,
+        lr=0.1,
+        last_n_layers=1,
+        trunk_momentum=0.8,
+        betas=(0.7, 0.9),
+        weight_decay=0.01,
+    )
+
+    model_a.trunk.weight.grad = torch.tensor([[0.4]])
+    model_a.head.weight.grad = torch.tensor([[0.4]])
+    optimizer_a.step()
+
+    model_b.load_state_dict(model_a.state_dict())
+    optimizer_b.load_state_dict(deepcopy(optimizer_a.state_dict()))
+
+    model_a.trunk.weight.grad = torch.tensor([[-0.1]])
+    model_a.head.weight.grad = torch.tensor([[-0.1]])
+    model_b.trunk.weight.grad = torch.tensor([[-0.1]])
+    model_b.head.weight.grad = torch.tensor([[-0.1]])
+
+    optimizer_a.step()
+    optimizer_b.step()
+
+    assert torch.allclose(
+        model_a.trunk.weight.detach(),
+        model_b.trunk.weight.detach(),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model_a.head.weight.detach(),
+        model_b.head.weight.detach(),
+        atol=1e-6,
+    )
+
+
+def test_add_param_group_is_rejected() -> None:
+    model = TwoLayerNet()
+    optimizer = STAC(model)
+    extra_parameter = nn.Parameter(torch.tensor([[1.0]]))
+
+    with pytest.raises(RuntimeError, match="does not support add_param_group"):
+        optimizer.add_param_group({"params": [extra_parameter]})
+
+
+def test_sparse_gradients_are_rejected_in_both_roles() -> None:
+    indices = torch.tensor([[0, 1], [2, 3]])
+
+    trunk_model = SparseNet()
+    trunk_optimizer = STAC(trunk_model, lr=0.1, last_n_layers=1)
+    trunk_loss = trunk_model(indices).sum()
+    trunk_loss.backward()
+
+    with pytest.raises(RuntimeError, match="sparse gradients"):
+        trunk_optimizer.step()
+
+    cap_model = SparseNet()
+    cap_optimizer = STAC(cap_model, lr=0.1, last_n_layers=2)
+    cap_loss = cap_model(indices).sum()
+    cap_loss.backward()
+
+    with pytest.raises(RuntimeError, match="sparse gradients"):
+        cap_optimizer.step()
+
+
+def test_nonfinite_gradients_can_raise() -> None:
+    model = TwoLayerNet()
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_layers=1,
+        error_if_nonfinite=True,
+    )
+
+    model.trunk.weight.grad = torch.tensor([[float("nan")]])
+    model.head.weight.grad = torch.tensor([[1.0]])
+
+    with pytest.raises(RuntimeError, match="non-finite gradients"):
+        optimizer.step()
