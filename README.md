@@ -29,6 +29,8 @@ practice.
 
 - Keeps the bulk of the model on sign-based updates.
 - Preserves AdamW on the last `N` trainable layers.
+- Uses materially less optimizer state than full AdamW when only the cap keeps
+  adaptive moments.
 - Uses deterministic partitioning based on `model.named_modules()`.
 - Exposes the chosen split through `optimizer.partition`.
 - Rejects sparse gradients and dynamic `add_param_group()` explicitly.
@@ -175,11 +177,22 @@ Verified local snapshot from `2026-03-18` on `torch 2.10.0+cu126` and an
 
 | Task | STAC default | Plain sign trunk | Wider cap (`last_n_layers=2`) | AdamW |
 | --- | ---: | ---: | ---: | ---: |
-| Regression mean loss | `0.075852` | `0.140853` | `0.077052` | `0.118262` |
+| Regression mean loss | `0.075852` | `0.140853` | `0.077104` | `0.118262` |
 | Classification mean loss | `0.006573` | `0.022765` | `0.011192` | `0.017693` |
 
+Representative optimizer-state snapshot on the same machine from the benchmark's
+deeper memory probe:
+
+| Optimizer | Optimizer state MB |
+| --- | ---: |
+| `STAC` default | `3.637` |
+| `STAC` plain sign trunk | `0.004` |
+| `STAC` wider cap | `3.762` |
+| `AdamW` | `7.270` |
+
 This benchmark is designed as a reproducible sanity check, not a universal
-leaderboard.
+leaderboard. It focuses on optimization quality and optimizer-state memory
+rather than claiming a universal wall-clock speedup.
 
 ## Verification
 
@@ -191,6 +204,12 @@ python -m build
 python -m twine check dist/*
 python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150
 ```
+
+Most recent local CUDA run on `2026-03-18`:
+
+- `python -m pytest -q`: `28 passed`
+- `python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150`:
+  produced the tables above
 
 What the test suite covers:
 

@@ -40,6 +40,27 @@ class ToyMLP(nn.Module):
         return self.head(inputs)
 
 
+class StateMemoryNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 512),
+            nn.ReLU(),
+            nn.Linear(512, 64),
+            nn.ReLU(),
+            nn.Linear(64, 8),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
+
+
 def resolve_device(requested: str) -> torch.device:
     if requested != "cuda":
         raise SystemExit("This benchmark is intended for CUDA. Use --device cuda.")
@@ -176,6 +197,44 @@ def summarize_task(
         )
 
 
+def optimizer_state_megabytes(optimizer: torch.optim.Optimizer) -> float:
+    total_bytes = sum(
+        value.numel() * value.element_size()
+        for state in optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+    return total_bytes / (1024**2)
+
+
+def summarize_state_memory(
+    *,
+    configs: list[BenchmarkConfig],
+    device: torch.device,
+) -> None:
+    print("\n## optimizer-state-memory")
+    print("| Optimizer | Optimizer state MB |")
+    print("| --- | ---: |")
+
+    for config in configs:
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
+        model = StateMemoryNet().to(device)
+        optimizer = build_optimizer(model, config)
+        inputs = torch.randn(128, 256, device=device)
+        targets = torch.randn(128, 8, device=device)
+
+        optimizer.zero_grad(set_to_none=True)
+        predictions = model(inputs)
+        loss = torch.nn.functional.mse_loss(predictions, targets)
+        loss.backward()
+        optimizer.step()
+
+        print(
+            f"| {config.label} | {optimizer_state_megabytes(optimizer):.3f} |"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -240,6 +299,7 @@ def main() -> None:
             seeds=args.seeds,
             steps=args.steps,
         )
+    summarize_state_memory(configs=configs, device=device)
 
 
 if __name__ == "__main__":
