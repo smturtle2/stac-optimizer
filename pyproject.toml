@@ -22,6 +22,7 @@ classifiers = [
 Homepage = "https://github.com/smturtle2/stac-optimizer"
 Repository = "https://github.com/smturtle2/stac-optimizer"
 Issues = "https://github.com/smturtle2/stac-optimizer/issues"
+"README (Korean)" = "https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md"
 
 [project.optional-dependencies]
 dev = [
@@ -44,3 +45,8 @@ version_scheme = "guess-next-dev"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "cuda: requires a CUDA device",
+  "slow: slower integration-style coverage",
+]
+pythonpath = ["src"]

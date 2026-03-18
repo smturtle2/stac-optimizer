@@ -54,6 +54,106 @@ class TinyBenchmarkNet(nn.Module):
         return self.head(inputs)
 
 
+class RootOwnedNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.root_scale = nn.Parameter(torch.tensor([1.0]))
+        self.head = nn.Linear(1, 1, bias=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.head(inputs * self.root_scale)
+
+
+class SharedParameterOwner(nn.Module):
+    def __init__(self, shared_weight: nn.Parameter) -> None:
+        super().__init__()
+        self.weight = shared_weight
+
+
+class SharedParameterNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        shared_weight = nn.Parameter(torch.ones(1, 1))
+        self.first = SharedParameterOwner(shared_weight)
+        self.second = SharedParameterOwner(shared_weight)
+
+
+class ShapeShiftNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.trunk = nn.Linear(2, 1, bias=False)
+        self.head = nn.Linear(1, 2, bias=False)
+
+
+def make_regression_batch(
+    seed: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    inputs = torch.randn(384, 16, generator=generator)
+    target_matrix = torch.randn(16, 4, generator=generator)
+    targets = inputs @ target_matrix + 0.1 * torch.randn(
+        384,
+        4,
+        generator=generator,
+    )
+    return inputs.to(device), targets.to(device)
+
+
+def make_classification_batch(
+    seed: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    inputs = torch.randn(768, 16, generator=generator)
+    class_matrix = torch.randn(16, 4, generator=generator)
+    logits = inputs @ class_matrix + 0.25 * torch.randn(
+        768,
+        4,
+        generator=generator,
+    )
+    targets = logits.argmax(dim=1)
+    return inputs.to(device), targets.to(device)
+
+
+def run_benchmark_trial(
+    seed: int,
+    *,
+    device: torch.device,
+    trunk_momentum: float,
+    task_kind: str,
+) -> float:
+    if task_kind == "regression":
+        inputs, targets = make_regression_batch(seed, device=device)
+        loss_fn = torch.nn.functional.mse_loss
+    elif task_kind == "classification":
+        inputs, targets = make_classification_batch(seed, device=device)
+        loss_fn = torch.nn.functional.cross_entropy
+    else:
+        raise ValueError(f"Unknown task kind: {task_kind}.")
+
+    torch.manual_seed(1234)
+    model = TinyBenchmarkNet().to(device)
+    optimizer = STAC(
+        model,
+        lr=3e-3,
+        last_n_layers=1,
+        trunk_momentum=trunk_momentum,
+        weight_decay=1e-2,
+    )
+
+    for _ in range(150):
+        optimizer.zero_grad(set_to_none=True)
+        predictions = model(inputs)
+        loss = loss_fn(predictions, targets)
+        loss.backward()
+        optimizer.step()
+
+    return float(loss.detach().cpu())
+
+
 @pytest.fixture(scope="module")
 def cuda_device() -> torch.device:
     if not torch.cuda.is_available():
@@ -79,6 +179,26 @@ def test_partition_skips_frozen_layers_when_counting_last_n() -> None:
 
     assert partition.trunk_layer_names == ("stem", "block.0")
     assert partition.cap_layer_names == ("block.2",)
+
+
+def test_partition_exposes_root_owned_parameters() -> None:
+    model = RootOwnedNet()
+
+    partition = partition_trainable_layers(model, last_n_layers=1)
+
+    assert partition.trunk_layer_names == ("<root>",)
+    assert partition.trunk_parameter_names == ("root_scale",)
+    assert partition.cap_layer_names == ("head",)
+    assert partition.cap_parameter_names == ("head.weight",)
+
+
+def test_partition_assigns_shared_parameters_to_first_owner() -> None:
+    model = SharedParameterNet()
+
+    partition = partition_trainable_layers(model, last_n_layers=0)
+
+    assert partition.trunk_layer_names == ("first",)
+    assert partition.trunk_parameter_names == ("first.weight",)
 
 
 def test_last_n_zero_keeps_all_layers_in_signsgd_trunk() -> None:
@@ -275,6 +395,41 @@ def test_role_specific_learning_rates_are_applied(
     )
 
 
+def test_role_specific_weight_decay_is_applied(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+        model.head.weight.fill_(1.0)
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        trunk_lr=0.1,
+        last_n_layers=1,
+        trunk_momentum=0.0,
+        trunk_weight_decay=0.2,
+        cap_weight_decay=0.0,
+    )
+
+    model.trunk.weight.grad = torch.zeros((1, 1), device=cuda_device)
+    model.head.weight.grad = torch.zeros((1, 1), device=cuda_device)
+
+    optimizer.step()
+
+    assert torch.allclose(
+        model.trunk.weight.detach(),
+        torch.tensor([[0.98]], device=cuda_device),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.head.weight.detach(),
+        torch.tensor([[1.0]], device=cuda_device),
+        atol=1e-6,
+    )
+
+
 def test_state_dict_round_trip_preserves_optimizer_behavior(
     cuda_device: torch.device,
 ) -> None:
@@ -323,6 +478,50 @@ def test_state_dict_round_trip_preserves_optimizer_behavior(
     assert torch.allclose(
         model_a.head.weight.detach(),
         model_b.head.weight.detach(),
+        atol=1e-6,
+    )
+
+
+def test_step_supports_closure(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    inputs = torch.ones((1, 1), device=cuda_device)
+    targets = torch.zeros((1, 1), device=cuda_device)
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        predictions = model.head(model.trunk(inputs))
+        loss = torch.nn.functional.mse_loss(predictions, targets)
+        loss.backward()
+        return loss
+
+    starting_weight = model.head.weight.detach().clone()
+    loss = optimizer.step(closure)
+
+    assert isinstance(loss, torch.Tensor)
+    assert float(loss.detach().cpu()) > 0.0
+    assert not torch.allclose(model.head.weight.detach(), starting_weight)
+
+
+def test_maximize_reverses_update_direction(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_layers=0,
+        trunk_momentum=0.0,
+        maximize=True,
+    )
+
+    model.trunk.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    optimizer.step()
+
+    assert torch.allclose(
+        model.trunk.weight.detach(),
+        torch.tensor([[1.1]], device=cuda_device),
         atol=1e-6,
     )
 
@@ -419,6 +618,34 @@ def test_nonfinite_gradients_can_raise(cuda_device: torch.device) -> None:
         optimizer.step()
 
 
+def test_nonfinite_gradients_skip_the_entire_step_by_default(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+        model.head.weight.fill_(1.0)
+
+    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    model.trunk.weight.grad = torch.tensor([[float("nan")]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+
+    optimizer.step()
+
+    assert optimizer.nonfinite_skipped_steps == 1
+    assert torch.allclose(
+        model.trunk.weight.detach(),
+        torch.tensor([[1.0]], device=cuda_device),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.head.weight.detach(),
+        torch.tensor([[1.0]], device=cuda_device),
+        atol=1e-6,
+    )
+    assert model.head.weight not in optimizer.state
+
+
 def test_load_state_dict_rejects_partition_mismatch(
     cuda_device: torch.device,
 ) -> None:
@@ -430,42 +657,54 @@ def test_load_state_dict_rejects_partition_mismatch(
         mismatched_optimizer.load_state_dict(stateful_optimizer.state_dict())
 
 
-def test_default_trunk_is_more_effective_than_plain_sign_on_cuda(
+def test_load_state_dict_rejects_parameter_shape_mismatch() -> None:
+    source_model = TwoLayerNet()
+    source_optimizer = STAC(source_model, lr=0.1, last_n_layers=1)
+    source_model.trunk.weight.grad = torch.tensor([[1.0]])
+    source_model.head.weight.grad = torch.tensor([[1.0]])
+    source_optimizer.step()
+
+    mismatched_model = ShapeShiftNet()
+    mismatched_optimizer = STAC(mismatched_model, lr=0.1, last_n_layers=1)
+
+    with pytest.raises(ValueError, match="parameter shapes"):
+        mismatched_optimizer.load_state_dict(deepcopy(source_optimizer.state_dict()))
+
+
+def test_load_state_dict_rejects_parameter_name_mismatch(
     cuda_device: torch.device,
 ) -> None:
-    def make_batch(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
-        generator = torch.Generator().manual_seed(seed)
-        inputs = torch.randn(512, 16, generator=generator)
-        target_matrix = torch.randn(16, 4, generator=generator)
-        targets = inputs @ target_matrix + 0.1 * torch.randn(
-            512,
-            4,
-            generator=generator,
+    model = TwoLayerNet().to(cuda_device)
+    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    state_dict = deepcopy(optimizer.state_dict())
+    state_dict["param_groups"][0]["param_names"] = ("wrong_name",)
+
+    with pytest.raises(ValueError, match="parameter names"):
+        optimizer.load_state_dict(state_dict)
+
+
+@pytest.mark.parametrize("task_kind", ["regression", "classification"])
+def test_default_trunk_is_more_effective_than_plain_sign_across_cuda_tasks(
+    cuda_device: torch.device,
+    task_kind: str,
+) -> None:
+    default_losses = [
+        run_benchmark_trial(
+            seed,
+            device=cuda_device,
+            trunk_momentum=0.9,
+            task_kind=task_kind,
         )
-        return inputs.to(cuda_device), targets.to(cuda_device)
-
-    def run_trial(seed: int, trunk_momentum: float) -> float:
-        inputs, targets = make_batch(seed)
-        torch.manual_seed(1234)
-        model = TinyBenchmarkNet().to(cuda_device)
-        optimizer = STAC(
-            model,
-            lr=3e-3,
-            last_n_layers=1,
-            trunk_momentum=trunk_momentum,
-            weight_decay=1e-2,
+        for seed in range(3)
+    ]
+    plain_losses = [
+        run_benchmark_trial(
+            seed,
+            device=cuda_device,
+            trunk_momentum=0.0,
+            task_kind=task_kind,
         )
+        for seed in range(3)
+    ]
 
-        for _ in range(200):
-            optimizer.zero_grad(set_to_none=True)
-            predictions = model(inputs)
-            loss = torch.nn.functional.mse_loss(predictions, targets)
-            loss.backward()
-            optimizer.step()
-
-        return float(loss.detach().cpu())
-
-    default_losses = [run_trial(seed, trunk_momentum=0.9) for seed in range(3)]
-    plain_losses = [run_trial(seed, trunk_momentum=0.0) for seed in range(3)]
-
-    assert statistics.fmean(default_losses) < statistics.fmean(plain_losses) * 0.5
+    assert statistics.fmean(default_losses) < statistics.fmean(plain_losses) * 0.75

@@ -1,11 +1,30 @@
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
 import statistics
+import sys
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if SOURCE_ROOT.exists():
+    sys.path.insert(0, str(SOURCE_ROOT))
+
 from stac_optimizer import STAC
+
+
+@dataclass(frozen=True)
+class BenchmarkConfig:
+    label: str
+    optimizer_kind: str
+    lr: float = 3e-3
+    last_n_layers: int = 1
+    trunk_momentum: float = 0.9
+    weight_decay: float = 1e-2
 
 
 class ToyMLP(nn.Module):
@@ -21,66 +40,205 @@ class ToyMLP(nn.Module):
         return self.head(inputs)
 
 
-def resolve_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def resolve_device(requested: str) -> torch.device:
+    if requested != "cuda":
+        raise SystemExit("This benchmark is intended for CUDA. Use --device cuda.")
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA is required for this benchmark, but no GPU is available.")
+    return torch.device("cuda")
 
 
-def make_batch(
+def make_regression_batch(
     seed: int,
     *,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    torch.manual_seed(seed)
-    inputs = torch.randn(256, 16)
-    target_matrix = torch.randn(16, 4)
-    targets = inputs @ target_matrix + 0.1 * torch.randn(256, 4)
+    generator = torch.Generator().manual_seed(seed)
+    inputs = torch.randn(384, 16, generator=generator)
+    target_matrix = torch.randn(16, 4, generator=generator)
+    targets = inputs @ target_matrix + 0.1 * torch.randn(
+        384,
+        4,
+        generator=generator,
+    )
     return inputs.to(device), targets.to(device)
 
 
-def run(seed: int, optimizer_kind: str, *, device: torch.device) -> float:
-    inputs, targets = make_batch(seed, device=device)
-    torch.manual_seed(0)
-    model = ToyMLP().to(device)
+def make_classification_batch(
+    seed: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    inputs = torch.randn(768, 16, generator=generator)
+    class_matrix = torch.randn(16, 4, generator=generator)
+    logits = inputs @ class_matrix + 0.25 * torch.randn(
+        768,
+        4,
+        generator=generator,
+    )
+    targets = logits.argmax(dim=1)
+    return inputs.to(device), targets.to(device)
 
-    if optimizer_kind == "stac-default":
-        optimizer = STAC(model, lr=3e-3, last_n_layers=1, weight_decay=1e-2)
-    elif optimizer_kind == "stac-plain":
-        optimizer = STAC(
+
+def build_optimizer(
+    model: nn.Module,
+    config: BenchmarkConfig,
+) -> torch.optim.Optimizer:
+    if config.optimizer_kind == "stac":
+        return STAC(
             model,
-            lr=3e-3,
-            last_n_layers=1,
-            trunk_momentum=0.0,
-            weight_decay=1e-2,
+            lr=config.lr,
+            last_n_layers=config.last_n_layers,
+            trunk_momentum=config.trunk_momentum,
+            weight_decay=config.weight_decay,
         )
-    elif optimizer_kind == "adamw":
-        optimizer = torch.optim.AdamW(
+    if config.optimizer_kind == "adamw":
+        return torch.optim.AdamW(
             model.parameters(),
-            lr=3e-3,
-            weight_decay=1e-2,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
         )
-    else:
-        raise ValueError(f"Unknown optimizer kind: {optimizer_kind}.")
+    raise ValueError(f"Unknown optimizer kind: {config.optimizer_kind}.")
 
-    for _ in range(200):
+
+def run_trial(
+    seed: int,
+    *,
+    config: BenchmarkConfig,
+    device: torch.device,
+    task_kind: str,
+    steps: int,
+) -> tuple[float, float | None]:
+    if task_kind == "regression":
+        inputs, targets = make_regression_batch(seed, device=device)
+        loss_fn = torch.nn.functional.mse_loss
+    elif task_kind == "classification":
+        inputs, targets = make_classification_batch(seed, device=device)
+        loss_fn = torch.nn.functional.cross_entropy
+    else:
+        raise ValueError(f"Unknown task kind: {task_kind}.")
+
+    torch.manual_seed(1234)
+    model = ToyMLP().to(device)
+    optimizer = build_optimizer(model, config)
+
+    for _ in range(steps):
         optimizer.zero_grad(set_to_none=True)
         predictions = model(inputs)
-        loss = torch.nn.functional.mse_loss(predictions, targets)
+        loss = loss_fn(predictions, targets)
         loss.backward()
         optimizer.step()
 
-    return float(loss.detach())
+    final_loss = float(loss.detach().cpu())
+    if task_kind == "classification":
+        with torch.no_grad():
+            accuracy = float(
+                (model(inputs).argmax(dim=1) == targets).float().mean().cpu()
+            )
+        return final_loss, accuracy
+    return final_loss, None
+
+
+def summarize_task(
+    task_kind: str,
+    *,
+    configs: list[BenchmarkConfig],
+    device: torch.device,
+    seeds: int,
+    steps: int,
+) -> None:
+    print(f"\n## {task_kind}")
+    print("| Optimizer | Mean loss | Min loss | Max loss | Mean accuracy |")
+    print("| --- | ---: | ---: | ---: | ---: |")
+
+    for config in configs:
+        losses: list[float] = []
+        accuracies: list[float] = []
+        for seed in range(seeds):
+            loss, accuracy = run_trial(
+                seed,
+                config=config,
+                device=device,
+                task_kind=task_kind,
+                steps=steps,
+            )
+            losses.append(loss)
+            if accuracy is not None:
+                accuracies.append(accuracy)
+
+        accuracy_text = (
+            f"{statistics.fmean(accuracies):.4f}" if accuracies else "n/a"
+        )
+        print(
+            f"| {config.label} | {statistics.fmean(losses):.6f} | "
+            f"{min(losses):.6f} | {max(losses):.6f} | {accuracy_text} |"
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run a small CUDA benchmark suite for STAC on synthetic regression "
+            "and classification tasks."
+        )
+    )
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        help="Benchmark device. Only 'cuda' is supported for this script.",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=5,
+        help="Number of random seeds to evaluate per optimizer/task pair.",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=150,
+        help="Number of optimization steps per trial.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    device = resolve_device()
-    print(f"device={device.type} torch={torch.__version__}")
-    for optimizer_kind in ("stac-default", "stac-plain", "adamw"):
-        losses = [run(seed, optimizer_kind, device=device) for seed in range(5)]
-        print(
-            optimizer_kind,
-            f"mean={statistics.fmean(losses):.6f}",
-            f"min={min(losses):.6f}",
-            f"max={max(losses):.6f}",
+    args = parse_args()
+    device = resolve_device(args.device)
+    print(
+        f"device={device.type} torch={torch.__version__} "
+        f"cuda={torch.version.cuda} seeds={args.seeds} steps={args.steps}"
+    )
+
+    configs = [
+        BenchmarkConfig(
+            label="STAC default (cap=1)",
+            optimizer_kind="stac",
+        ),
+        BenchmarkConfig(
+            label="STAC plain sign trunk",
+            optimizer_kind="stac",
+            trunk_momentum=0.0,
+        ),
+        BenchmarkConfig(
+            label="STAC wider cap (cap=2)",
+            optimizer_kind="stac",
+            last_n_layers=2,
+        ),
+        BenchmarkConfig(
+            label="AdamW baseline",
+            optimizer_kind="adamw",
+        ),
+    ]
+
+    for task_kind in ("regression", "classification"):
+        summarize_task(
+            task_kind,
+            configs=configs,
+            device=device,
+            seeds=args.seeds,
+            steps=args.steps,
         )
 
 

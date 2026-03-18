@@ -1,37 +1,61 @@
 # stac-optimizer
 
+[![PyPI version](https://img.shields.io/pypi/v/stac-optimizer)](https://pypi.org/project/stac-optimizer/)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/downloads/release/python-3130/)
+[![Torch >= 2.10](https://img.shields.io/badge/torch-%3E%3D2.10-ee4c2c)](https://pytorch.org/)
+[![CI](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml/badge.svg)](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml)
+
+[Korean README](README.ko.md)
+
 STAC stands for SignSGD Trunk, AdamW Cap.
 
-It is a PyTorch optimizer for models where you want cheap sign-based updates
-through most of the network, but still want AdamW on the last few trainable
-layers where optimization is often most sensitive. The default trunk is
-`sign(momentum)` rather than plain `sign(grad)` because the momentum-smoothed
-variant is materially more stable in both theory and practice.
+It is a PyTorch optimizer for models where you want sign-based updates through
+most of the network, but still want AdamW on the last few trainable layers
+where optimization is usually more sensitive. The trunk uses
+`sign(momentum-smoothed gradient)` by default because momentum-stabilized sign
+methods are materially more reliable than plain `sign(grad)` in both theory and
+practice.
 
 | Item | Value |
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
 | Default split | last `1` trainable layer uses AdamW |
-| Trunk update | sign-based update with momentum smoothing |
+| Trunk update | decoupled weight decay + `sign(EMA(grad))` |
 | Cap update | AdamW with decoupled weight decay |
+| CUDA validation | local tests and benchmark suite |
 
 ## Why STAC
 
 - Keeps the bulk of the model on sign-based updates.
-- Preserves AdamW where late-layer adaptation matters most.
-- Partitions layers deterministically from `model.named_modules()`.
-- Supports separate learning rates and weight decay for trunk and cap.
-- Exposes the chosen partition through `optimizer.partition`.
+- Preserves AdamW on the last `N` trainable layers.
+- Uses deterministic partitioning based on `model.named_modules()`.
+- Exposes the chosen split through `optimizer.partition`.
 - Rejects sparse gradients and dynamic `add_param_group()` explicitly.
+- Skips the whole step on non-finite dense gradients unless
+  `error_if_nonfinite=True`.
+- Validates optimizer checkpoints against layer names, parameter names, and
+  saved state shapes.
 
-## Install
+## Optimizer Layout
 
-```bash
-python -m pip install .
+```mermaid
+flowchart LR
+    A[Trainable layers in registration order] --> B[Earlier layers]
+    A --> C[Last N layers]
+    B --> D[STAC trunk<br/>decoupled weight decay<br/>EMA(grad) -> sign update]
+    C --> E[STAC cap<br/>AdamW<br/>decoupled weight decay]
 ```
 
-Development install:
+## Installation
+
+Install from PyPI:
+
+```bash
+python -m pip install stac-optimizer
+```
+
+Install the local repository for development:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -73,126 +97,131 @@ loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 
-print("trunk:", optimizer.partition.trunk_layer_names)
-print("cap:", optimizer.partition.cap_layer_names)
+print("trunk layers:", optimizer.partition.trunk_layer_names)
+print("trunk params:", optimizer.partition.trunk_parameter_names)
+print("cap layers:", optimizer.partition.cap_layer_names)
+print("cap params:", optimizer.partition.cap_parameter_names)
 ```
 
-## Partition Rule
+## Partition Rules
 
-STAC walks trainable layers in module registration order and splits them into
-two regions:
+STAC walks `model.named_modules()` in registration order and treats each module
+that owns trainable parameters directly (`recurse=False`) as one layer.
 
-```text
-[ earlier trainable layers ................. ][ last N trainable layers ]
-                  trunk: signSGD-like                        cap: AdamW
-```
-
-- Layer discovery uses `named_parameters(recurse=False)`.
+- The final `last_n_layers` trainable layers become the AdamW cap.
 - Frozen parameters are skipped when counting layers.
 - Shared parameters are assigned to the first discovered owner.
 - Root-level parameters are exposed as `"<root>"`.
-- `last_n_layers=0` keeps the whole model in the trunk.
-- Oversized `last_n_layers` moves the whole model into the cap.
+- `last_n_layers=0` keeps the whole model in the sign-based trunk.
+- Oversized `last_n_layers` moves the whole model into the AdamW cap.
 
-## Hyperparameters
+## Public API
 
-| Argument | Meaning |
-| --- | --- |
-| `lr` | Shared base learning rate. |
-| `trunk_lr`, `cap_lr` | Role-specific learning rates. If `trunk_lr` is omitted in hybrid mode, STAC defaults it to `0.75 * lr`. |
-| `last_n_layers` | Number of final trainable layers that become AdamW. |
-| `trunk_momentum` | EMA factor for the trunk before taking the sign. |
-| `weight_decay` | Shared default decoupled weight decay. |
-| `trunk_weight_decay`, `cap_weight_decay` | Role-specific decoupled weight decay. |
-| `betas`, `eps`, `amsgrad` | AdamW cap hyperparameters. |
-| `maximize` | Maximize instead of minimize. |
-| `error_if_nonfinite` | Raise on `NaN` or `Inf` gradients. |
+The public package exports:
 
-## Stability Notes
+- `STAC`: the optimizer itself.
+- `partition_trainable_layers(model, last_n_layers=1)`: inspect the split
+  without constructing the optimizer.
+- `LayerGroup`: one trainable module slice with `name`, `parameter_names`, and
+  `parameters`.
+- `STACPartition`: immutable split metadata with
+  `trunk_layer_names`, `cap_layer_names`,
+  `trunk_parameter_names`, `cap_parameter_names`,
+  `trunk_parameters`, and `cap_parameters`.
+
+## Design Notes
 
 The defaults are intentionally conservative:
 
-- The trunk uses momentum because sign-only methods are substantially more
-  stable when the sign is taken after smoothing. See
-  [signSGD with Majority Vote](https://arxiv.org/abs/1810.05291) and
+- The trunk uses momentum because momentum-smoothed sign methods are more
+  stable than plain sign-only updates. See
+  [signSGD: Compressed Optimisation for Non-Convex Problems](https://arxiv.org/abs/1802.04434)
+  and
   [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html).
-- The cap uses AdamW-style decoupled weight decay rather than mixing decay
-  into the gradient. See
+- The cap uses AdamW-style decoupled weight decay rather than mixing weight
+  decay into the gradient. See
   [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101).
-- Recent analysis shows sign-based methods have different optimization
-  tradeoffs from SGD and Adam depending on noise and conditioning, which is
-  why STAC exposes both `last_n_layers` and separate trunk/cap learning rates.
-  See
-  [Exact Risk Curves of SignSGD in Modern Overparameterized Linear Regression](https://proceedings.mlr.press/v267/xiao25c.html).
+- Layer selection stays explicit because sign-based and adaptive methods have
+  different tradeoffs depending on noise, conditioning, and where adaptation is
+  most useful in the network.
 
 Practical tuning guidance:
 
-- If training is noisy or unstable, raise `trunk_momentum` before increasing
-  the trunk learning rate.
-- If the model underfits, move more layers into the AdamW cap with a larger
+- If training is unstable, increase `trunk_momentum` before increasing
+  `trunk_lr`.
+- If the head adapts too slowly, increase `cap_lr`.
+- If the model underfits, move more layers into the cap by increasing
   `last_n_layers`.
-- If the head adapts too slowly, raise `cap_lr` without forcing the entire
-  network into AdamW.
 
-## Benchmark Snapshot
+## CUDA Benchmark Suite
 
-The repository includes [`examples/toy_benchmark.py`](examples/toy_benchmark.py)
-for a quick sanity check. A representative local run on `Python 3.13.12` and
-`torch 2.10.0+cu126` produced:
+The repository includes [`examples/toy_benchmark.py`](examples/toy_benchmark.py),
+which runs synthetic regression and classification tasks across multiple seeds
+on CUDA. It compares:
 
-| Optimizer | Mean final loss |
-| --- | ---: |
-| `STAC` default | `0.033961` |
-| `STAC` with plain sign trunk | `0.107899` |
-| `torch.optim.AdamW` | `0.074642` |
+- `STAC default (cap=1)`
+- `STAC plain sign trunk`
+- `STAC wider cap (cap=2)`
+- `AdamW baseline`
 
-This is a sanity benchmark, not a universal ranking. The important signal is
-that the default STAC trunk is meaningfully better than a plain sign trunk on a
-real optimization loop.
+Run it with:
 
-## Constraints
+```bash
+python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150
+```
 
-- Sparse gradients are unsupported in both trunk and cap.
-- `add_param_group()` is intentionally unsupported because STAC derives its
-  parameter groups from model structure.
-- The split follows module registration order, not dynamic forward order.
+Verified local snapshot from `2026-03-18` on `torch 2.10.0+cu126` and an
+`NVIDIA GeForce RTX 3070`:
+
+| Task | STAC default | Plain sign trunk | Wider cap (`last_n_layers=2`) | AdamW |
+| --- | ---: | ---: | ---: | ---: |
+| Regression mean loss | `0.075852` | `0.140853` | `0.077052` | `0.118262` |
+| Classification mean loss | `0.006573` | `0.022765` | `0.011192` | `0.017693` |
+
+This benchmark is designed as a reproducible sanity check, not a universal
+leaderboard.
 
 ## Verification
 
-GitHub Actions automation:
-
-- On pull requests and pushes to `main`: CPU-based tests, packaging, and built
-  wheel smoke checks.
-- On `v*` tags: version validation, rebuild, `twine check`, PyPI publishing,
-  and GitHub Release creation.
-
-Local CUDA verification for maintainers before a release:
+Local CUDA verification:
 
 ```bash
 python -m pytest -q
 python -m build
 python -m twine check dist/*
-python examples/toy_benchmark.py
+python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150
 ```
 
-Most recent local CUDA run:
+What the test suite covers:
 
-- `python -m pytest -q`: `17 passed in 6.45s`
-- `python -m build` and `python -m twine check dist/*`: passed
-- `python examples/toy_benchmark.py`:
-  `STAC` default `0.033961`, plain sign trunk `0.107899`, `AdamW` `0.074642`
+- deterministic partitioning behavior
+- optimizer-step parity against AdamW for the cap
+- sparse-gradient and non-finite gradient safeguards
+- checkpoint round-trips and mismatch rejection
+- CUDA comparisons showing the default trunk beating plain signSGD on both
+  regression and classification tasks
+- CUDA integration checks showing STAC stays competitive with AdamW while
+  using materially less optimizer state
+
+GitHub Actions automation:
+
+- On pull requests and pushes to `main`: CPU tests, packaging, and wheel smoke
+  checks.
+- On `v*` tags: version validation, rebuild, `twine check`, PyPI publishing,
+  and GitHub Release creation.
 
 ## Release
 
-This repository uses `setuptools-scm`, so release tags must match the package
-version that the workflow computes from the tagged commit.
+This project uses `setuptools-scm`, so releases are created from Git tags.
+Repository changelog entries live in GitHub Releases rather than a committed
+`CHANGELOG.md`.
 
 Typical release flow:
 
 ```bash
 git push origin main
-git tag v0.1.2
-git push origin v0.1.2
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 The tag workflow then:
@@ -202,6 +231,5 @@ The tag workflow then:
 3. Publishes to PyPI via GitHub Actions Trusted Publishing.
 4. Creates the matching GitHub Release and attaches the built artifacts.
 
-Project maintainers must register this repository and
-`.github/workflows/workflow.yml` as a Trusted Publisher on PyPI for the publish
-step to succeed.
+PyPI Trusted Publishing must be configured for this repository and
+`.github/workflows/workflow.yml` before the publish step can succeed.
