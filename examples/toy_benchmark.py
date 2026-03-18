@@ -21,18 +21,26 @@ class ToyMLP(nn.Module):
         return self.head(inputs)
 
 
-def make_batch(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+def resolve_device() -> torch.device:
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def make_batch(
+    seed: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
     torch.manual_seed(seed)
     inputs = torch.randn(256, 16)
     target_matrix = torch.randn(16, 4)
     targets = inputs @ target_matrix + 0.1 * torch.randn(256, 4)
-    return inputs, targets
+    return inputs.to(device), targets.to(device)
 
 
-def run(seed: int, optimizer_kind: str) -> float:
-    inputs, targets = make_batch(seed)
+def run(seed: int, optimizer_kind: str, *, device: torch.device) -> float:
+    inputs, targets = make_batch(seed, device=device)
     torch.manual_seed(0)
-    model = ToyMLP()
+    model = ToyMLP().to(device)
 
     if optimizer_kind == "stac-default":
         optimizer = STAC(model, lr=3e-3, last_n_layers=1, weight_decay=1e-2)
@@ -64,8 +72,10 @@ def run(seed: int, optimizer_kind: str) -> float:
 
 
 def main() -> None:
+    device = resolve_device()
+    print(f"device={device.type} torch={torch.__version__}")
     for optimizer_kind in ("stac-default", "stac-plain", "adamw"):
-        losses = [run(seed, optimizer_kind) for seed in range(5)]
+        losses = [run(seed, optimizer_kind, device=device) for seed in range(5)]
         print(
             optimizer_kind,
             f"mean={statistics.fmean(losses):.6f}",

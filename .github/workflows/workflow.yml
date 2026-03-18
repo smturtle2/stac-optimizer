@@ -83,6 +83,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
 
     steps:
       - name: Check out repository
@@ -123,6 +124,11 @@ jobs:
 
       - name: Validate package metadata
         run: python -m twine check dist/*
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

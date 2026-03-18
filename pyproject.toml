@@ -28,6 +28,7 @@ Changelog = "https://github.com/smturtle2/stac-optimizer/blob/main/CHANGELOG.md"
 dev = [
   "build>=1.2",
   "pytest>=8.3",
+  "setuptools-scm>=8",
   "twine>=6.1",
 ]
 

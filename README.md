@@ -1,33 +1,28 @@
 # stac-optimizer
 
-<p align="center">
-  <img src="docs/assets/stac-hero.svg" alt="STAC hero banner" width="100%">
-</p>
-
-<p align="center">
-  <a href="https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml">
-    <img alt="CI" src="https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml/badge.svg?branch=main">
-  </a>
-  <img alt="Python 3.13" src="https://img.shields.io/badge/python-3.13-10244B">
-  <img alt="Torch 2.10+" src="https://img.shields.io/badge/torch-2.10%2B-E98034">
-  <img alt="Optimizer" src="https://img.shields.io/badge/optimizer-sign%20trunk%20%2B%20AdamW%20cap-173268">
-</p>
-
 STAC stands for SignSGD Trunk, AdamW Cap.
 
-It is a PyTorch optimizer that keeps most of the model on cheap sign-based
-updates, then switches the last `N` trainable layers to AdamW. The default
-trunk is not raw `sign(grad)`: it uses a momentum accumulator and applies
-`sign(momentum)` because that is materially more stable in practice. If you
-want textbook signSGD, set `trunk_momentum=0.0`.
+It is a PyTorch optimizer for models where you want cheap sign-based updates
+through most of the network, but still want AdamW on the last few trainable
+layers where optimization is often most sensitive. The default trunk is
+`sign(momentum)` rather than plain `sign(grad)` because the momentum-smoothed
+variant is materially more stable in both theory and practice.
 
-## What It Does
+| Item | Value |
+| --- | --- |
+| Python | `>=3.13` |
+| PyTorch | `>=2.10` |
+| Default split | last `1` trainable layer uses AdamW |
+| Trunk update | sign-based update with momentum smoothing |
+| Cap update | AdamW with decoupled weight decay |
 
-- Walks `model.named_modules()` in deterministic registration order.
-- Treats every module with direct trainable parameters as one layer.
-- Sends the last `N` trainable layers to the AdamW cap.
-- Keeps all earlier layers in the sign-based trunk.
-- Supports role-specific learning rates and weight decay.
+## Why STAC
+
+- Keeps the bulk of the model on sign-based updates.
+- Preserves AdamW where late-layer adaptation matters most.
+- Partitions layers deterministically from `model.named_modules()`.
+- Supports separate learning rates and weight decay for trunk and cap.
+- Exposes the chosen partition through `optimizer.partition`.
 - Rejects sparse gradients and dynamic `add_param_group()` explicitly.
 
 ## Install
@@ -84,9 +79,13 @@ print("cap:", optimizer.partition.cap_layer_names)
 
 ## Partition Rule
 
-<p align="center">
-  <img src="docs/assets/stac-partition.svg" alt="STAC partition rule" width="100%">
-</p>
+STAC walks trainable layers in module registration order and splits them into
+two regions:
+
+```text
+[ earlier trainable layers ................. ][ last N trainable layers ]
+                  trunk: signSGD-like                        cap: AdamW
+```
 
 - Layer discovery uses `named_parameters(recurse=False)`.
 - Frozen parameters are skipped when counting layers.
@@ -99,34 +98,57 @@ print("cap:", optimizer.partition.cap_layer_names)
 
 | Argument | Meaning |
 | --- | --- |
-| `lr` | Shared default learning rate. |
-| `trunk_lr`, `cap_lr` | Role-specific learning rates. |
+| `lr` | Shared base learning rate. |
+| `trunk_lr`, `cap_lr` | Role-specific learning rates. If `trunk_lr` is omitted in hybrid mode, STAC defaults it to `0.75 * lr`. |
 | `last_n_layers` | Number of final trainable layers that become AdamW. |
 | `trunk_momentum` | EMA factor for the trunk before taking the sign. |
 | `weight_decay` | Shared default decoupled weight decay. |
 | `trunk_weight_decay`, `cap_weight_decay` | Role-specific decoupled weight decay. |
-| `betas`, `eps` | AdamW cap hyperparameters. |
+| `betas`, `eps`, `amsgrad` | AdamW cap hyperparameters. |
 | `maximize` | Maximize instead of minimize. |
 | `error_if_nonfinite` | Raise on `NaN` or `Inf` gradients. |
 
+## Stability Notes
+
+The defaults are intentionally conservative:
+
+- The trunk uses momentum because sign-only methods are substantially more
+  stable when the sign is taken after smoothing. See
+  [signSGD with Majority Vote](https://arxiv.org/abs/1810.05291) and
+  [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html).
+- The cap uses AdamW-style decoupled weight decay rather than mixing decay
+  into the gradient. See
+  [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101).
+- Recent analysis shows sign-based methods have different optimization
+  tradeoffs from SGD and Adam depending on noise and conditioning, which is
+  why STAC exposes both `last_n_layers` and separate trunk/cap learning rates.
+  See
+  [Exact Risk Curves of SignSGD in Modern Overparameterized Linear Regression](https://proceedings.mlr.press/v267/xiao25c.html).
+
+Practical tuning guidance:
+
+- If training is noisy or unstable, raise `trunk_momentum` before increasing
+  the trunk learning rate.
+- If the model underfits, move more layers into the AdamW cap with a larger
+  `last_n_layers`.
+- If the head adapts too slowly, raise `cap_lr` without forcing the entire
+  network into AdamW.
+
 ## Benchmark Snapshot
 
-<p align="center">
-  <img src="docs/assets/stac-benchmark.svg" alt="Toy benchmark comparison" width="100%">
-</p>
-
-These numbers come from [`examples/toy_benchmark.py`](examples/toy_benchmark.py)
-on `Python 3.13.12` and `torch 2.10.0+cu126`.
+The repository includes [`examples/toy_benchmark.py`](examples/toy_benchmark.py)
+for a quick sanity check. A representative local run on `Python 3.13.12` and
+`torch 2.10.0+cu126` produced:
 
 | Optimizer | Mean final loss |
 | --- | ---: |
-| `STAC` default | `0.052278` |
-| `STAC` with plain sign trunk | `0.119689` |
+| `STAC` default | `0.033961` |
+| `STAC` with plain sign trunk | `0.107899` |
 | `torch.optim.AdamW` | `0.074642` |
 
-This is a sanity benchmark, not a universal claim. It does show the important
-part: the default STAC configuration is not just API-correct, it is materially
-better than a plain sign trunk on a real optimization loop.
+This is a sanity benchmark, not a universal ranking. The important signal is
+that the default STAC trunk is meaningfully better than a plain sign trunk on a
+real optimization loop.
 
 ## Constraints
 
@@ -135,31 +157,53 @@ better than a plain sign trunk on a real optimization loop.
   parameter groups from model structure.
 - The split follows module registration order, not dynamic forward order.
 
-## Development
+## Verification
+
+GitHub Actions automation:
+
+- On pull requests and pushes to `main`: CPU-based tests, packaging, and built
+  wheel smoke checks.
+- On `v*` tags: version validation, rebuild, `twine check`, PyPI publishing,
+  and GitHub Release creation.
+
+Local CUDA verification for maintainers before a release:
 
 ```bash
 python -m pytest -q
 python -m build
+python -m twine check dist/*
 python examples/toy_benchmark.py
 ```
 
-Current local verification:
+Most recent local CUDA run:
 
-- `python -m pytest -q` passed with `13` tests.
-- `python -m build` produced sdist and wheel successfully.
-- `python examples/toy_benchmark.py` reproduced the benchmark table above.
+- `python -m pytest -q`: `17 passed in 6.45s`
+- `python -m build` and `python -m twine check dist/*`: passed
+- `python examples/toy_benchmark.py`:
+  `STAC` default `0.033961`, plain sign trunk `0.107899`, `AdamW` `0.074642`
 
 ## Release
 
-`.github/workflows/workflow.yml` runs tests, packages the project, validates the
-built artifacts with `twine check`, and creates a GitHub Release for `v*` tags.
+This repository uses `setuptools-scm`, so release tags must match the package
+version that the workflow computes from the tagged commit.
 
-Typical flow:
+Typical release flow:
 
 ```bash
 git push origin main
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
-See [CHANGELOG.md](CHANGELOG.md) for change history.
+The tag workflow then:
+
+1. Verifies that `vX.Y.Z` matches the computed package version.
+2. Builds fresh distributions and runs `twine check`.
+3. Publishes to PyPI via GitHub Actions Trusted Publishing.
+4. Creates the matching GitHub Release and attaches the built artifacts.
+
+Project maintainers must register this repository and
+`.github/workflows/workflow.yml` as a Trusted Publisher on PyPI for the publish
+step to succeed.
+
+See [CHANGELOG.md](CHANGELOG.md) for released versions only.

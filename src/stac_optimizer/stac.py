@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
 from torch.optim import Optimizer
 
+_HYBRID_TRUNK_LR_SCALE = 0.75
+
 
 @dataclass(frozen=True)
 class LayerGroup:
+    """One trainable module slice discovered by :func:`partition_trainable_layers`.
+
+    Attributes:
+        name: Module path in ``model.named_modules()`` order. Root-owned parameters
+            use ``"<root>"``.
+        parameter_names: Fully-qualified parameter names that belong to the layer.
+        parameters: Trainable parameters owned directly by that module.
+    """
+
     name: str
     parameter_names: tuple[str, ...]
     parameters: tuple[nn.Parameter, ...]
@@ -18,19 +30,24 @@ class LayerGroup:
 
 @dataclass(frozen=True)
 class STACPartition:
+    """Deterministic split of trainable layers into the sign trunk and AdamW cap."""
+
     trunk_layers: tuple[LayerGroup, ...]
     cap_layers: tuple[LayerGroup, ...]
 
     @property
     def trunk_layer_names(self) -> tuple[str, ...]:
+        """Names of trainable layers updated by the sign-based trunk."""
         return tuple(layer.name for layer in self.trunk_layers)
 
     @property
     def cap_layer_names(self) -> tuple[str, ...]:
+        """Names of trainable layers updated by the AdamW cap."""
         return tuple(layer.name for layer in self.cap_layers)
 
     @property
     def trunk_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Flattened trainable parameters that belong to the sign-based trunk."""
         return tuple(
             parameter
             for layer in self.trunk_layers
@@ -39,6 +56,7 @@ class STACPartition:
 
     @property
     def cap_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Flattened trainable parameters that belong to the AdamW cap."""
         return tuple(
             parameter
             for layer in self.cap_layers
@@ -51,6 +69,26 @@ def partition_trainable_layers(
     *,
     last_n_layers: int = 1,
 ) -> STACPartition:
+    """Split a model into a sign trunk and AdamW cap by trainable layer order.
+
+    STAC walks ``model.named_modules()`` in registration order and treats each
+    module that owns trainable parameters directly as one layer. The final
+    ``last_n_layers`` layers become the AdamW cap; everything before that stays
+    in the sign-based trunk.
+
+    Args:
+        model: Module whose trainable parameters should be partitioned.
+        last_n_layers: Number of final trainable layers that should use AdamW.
+
+    Returns:
+        A deterministic partition describing which layers belong to the trunk
+        and which belong to the cap.
+
+    Raises:
+        ValueError: If ``last_n_layers`` is negative or the model has no
+            trainable parameters.
+    """
+
     if last_n_layers < 0:
         raise ValueError("last_n_layers must be greater than or equal to 0.")
 
@@ -103,6 +141,10 @@ class STAC(Optimizer):
     trunk update. By default the trunk accumulates gradients with momentum
     before taking the sign, which is markedly more stable than plain signSGD.
     Set ``trunk_momentum=0.0`` to recover textbook signSGD.
+
+    When both the trunk and cap are active, leaving ``trunk_lr`` unset makes
+    STAC use ``0.75 * lr`` for the sign trunk and ``lr`` for the AdamW cap.
+    This keeps the sign-based path slightly more conservative by default.
     """
 
     def __init__(
@@ -119,6 +161,7 @@ class STAC(Optimizer):
         weight_decay: float = 0.0,
         trunk_weight_decay: float | None = None,
         cap_weight_decay: float | None = None,
+        amsgrad: bool = False,
         maximize: bool = False,
         error_if_nonfinite: bool = False,
     ) -> None:
@@ -135,7 +178,16 @@ class STAC(Optimizer):
                 f"Invalid trunk_momentum value: {trunk_momentum}."
             )
 
-        trunk_lr = lr if trunk_lr is None else trunk_lr
+        partition = partition_trainable_layers(
+            model,
+            last_n_layers=last_n_layers,
+        )
+        default_trunk_lr = (
+            lr * _HYBRID_TRUNK_LR_SCALE
+            if partition.trunk_layers and partition.cap_layers
+            else lr
+        )
+        trunk_lr = default_trunk_lr if trunk_lr is None else trunk_lr
         cap_lr = lr if cap_lr is None else cap_lr
         trunk_weight_decay = (
             weight_decay if trunk_weight_decay is None else trunk_weight_decay
@@ -149,10 +201,7 @@ class STAC(Optimizer):
         self._validate_nonnegative("trunk_weight_decay", trunk_weight_decay)
         self._validate_nonnegative("cap_weight_decay", cap_weight_decay)
 
-        self.partition = partition_trainable_layers(
-            model,
-            last_n_layers=last_n_layers,
-        )
+        self.partition = partition
         self.last_n_layers = last_n_layers
 
         param_groups: list[dict[str, object]] = []
@@ -188,6 +237,7 @@ class STAC(Optimizer):
             "weight_decay": weight_decay,
             "trunk_weight_decay": trunk_weight_decay,
             "cap_weight_decay": cap_weight_decay,
+            "amsgrad": amsgrad,
             "maximize": maximize,
             "error_if_nonfinite": error_if_nonfinite,
         }
@@ -219,7 +269,22 @@ class STAC(Optimizer):
             group.setdefault("stac_role", "trunk")
             group.setdefault("layer_names", ())
             group.setdefault("trunk_momentum", 0.0)
+            group.setdefault("betas", (0.9, 0.999))
+            group.setdefault("eps", 1e-8)
+            group.setdefault("amsgrad", False)
             group.setdefault("error_if_nonfinite", False)
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """Load optimizer state while preserving the current STAC partition.
+
+        STAC derives its parameter groups from model structure, so loading a
+        state dict whose saved trunk/cap split does not match the current
+        optimizer is almost always a user error. This override validates the
+        partition before delegating to :meth:`torch.optim.Optimizer.load_state_dict`.
+        """
+
+        self._validate_state_dict_partition(state_dict)
+        super().load_state_dict(state_dict)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None):
@@ -282,6 +347,7 @@ class STAC(Optimizer):
         beta1, beta2 = group["betas"]
         eps = float(group["eps"])
         weight_decay = float(group["weight_decay"])
+        amsgrad = bool(group["amsgrad"])
         maximize = bool(group["maximize"])
         error_if_nonfinite = bool(group["error_if_nonfinite"])
 
@@ -305,6 +371,11 @@ class STAC(Optimizer):
                     parameter,
                     memory_format=torch.preserve_format,
                 )
+                if amsgrad:
+                    state["max_exp_avg_sq"] = torch.zeros_like(
+                        parameter,
+                        memory_format=torch.preserve_format,
+                    )
 
             exp_avg = state["exp_avg"]
             exp_avg_sq = state["exp_avg_sq"]
@@ -320,9 +391,62 @@ class STAC(Optimizer):
             bias_correction1 = 1 - beta1**step
             bias_correction2 = 1 - beta2**step
 
-            denom = exp_avg_sq.sqrt().div(math.sqrt(bias_correction2)).add_(eps)
+            denom_source = exp_avg_sq
+            if amsgrad:
+                max_exp_avg_sq = state["max_exp_avg_sq"]
+                torch.maximum(max_exp_avg_sq, exp_avg_sq, out=max_exp_avg_sq)
+                denom_source = max_exp_avg_sq
+
+            denom = denom_source.sqrt().div(math.sqrt(bias_correction2)).add_(eps)
             step_size = lr / bias_correction1
             parameter.addcdiv_(exp_avg, denom, value=-step_size)
+
+    def _validate_state_dict_partition(self, state_dict: Mapping[str, Any]) -> None:
+        saved_groups = state_dict.get("param_groups")
+        if not isinstance(saved_groups, Sequence):
+            raise ValueError("STAC expected 'param_groups' in the optimizer state.")
+
+        if len(saved_groups) != len(self.param_groups):
+            raise ValueError(
+                "Saved STAC state uses a different number of parameter groups. "
+                "Recreate the optimizer with the same model partition before "
+                "loading the state dict."
+            )
+
+        for index, (saved_group, current_group) in enumerate(
+            zip(saved_groups, self.param_groups, strict=True)
+        ):
+            if not isinstance(saved_group, Mapping):
+                raise ValueError(
+                    f"Saved STAC param group {index} is malformed: {saved_group!r}."
+                )
+
+            saved_role = saved_group.get("stac_role", current_group["stac_role"])
+            current_role = current_group["stac_role"]
+            if saved_role != current_role:
+                raise ValueError(
+                    "Saved STAC state does not match the current trunk/cap split: "
+                    f"group {index} expects role {saved_role!r}, but the current "
+                    f"optimizer uses {current_role!r}."
+                )
+
+            saved_param_count = len(saved_group.get("params", ()))
+            current_param_count = len(current_group["params"])
+            if saved_param_count != current_param_count:
+                raise ValueError(
+                    "Saved STAC state does not match the current parameter layout: "
+                    f"group {index} contains {saved_param_count} parameters in the "
+                    f"checkpoint but {current_param_count} in the current optimizer."
+                )
+
+            saved_layer_names = tuple(saved_group.get("layer_names", ()))
+            current_layer_names = tuple(current_group.get("layer_names", ()))
+            if saved_layer_names and saved_layer_names != current_layer_names:
+                raise ValueError(
+                    "Saved STAC state was created for different trainable layers: "
+                    f"group {index} checkpoint layers {saved_layer_names!r} do not "
+                    f"match current layers {current_layer_names!r}."
+                )
 
     @staticmethod
     def _assert_finite(

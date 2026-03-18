@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
+import statistics
 
 import pytest
 import torch
@@ -38,6 +39,26 @@ class SparseNet(nn.Module):
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         embedded = self.embedding(indices).sum(dim=1)
         return self.head(embedded)
+
+
+class TinyBenchmarkNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(16, 32)
+        self.fc2 = nn.Linear(32, 32)
+        self.head = nn.Linear(32, 4)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        inputs = torch.relu(self.fc1(inputs))
+        inputs = torch.relu(self.fc2(inputs))
+        return self.head(inputs)
+
+
+@pytest.fixture(scope="module")
+def cuda_device() -> torch.device:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for STAC optimizer step tests.")
+    return torch.device("cuda")
 
 
 def test_partition_defaults_to_last_trainable_layer() -> None:
@@ -90,6 +111,17 @@ def test_last_n_larger_than_layer_count_promotes_all_layers_to_cap() -> None:
     )
 
 
+def test_default_hybrid_trunk_lr_is_scaled_down() -> None:
+    model = TwoLayerNet()
+
+    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+
+    assert optimizer.param_groups[0]["stac_role"] == "trunk"
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.075)
+    assert optimizer.param_groups[1]["stac_role"] == "cap"
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
+
+
 def test_negative_last_n_layers_is_rejected() -> None:
     model = StackedNet()
 
@@ -106,8 +138,10 @@ def test_requires_at_least_one_trainable_parameter() -> None:
         STAC(model)
 
 
-def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
-    model = TwoLayerNet()
+def test_trunk_uses_plain_signsgd_while_cap_matches_adamw(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
     with torch.no_grad():
         model.trunk.weight.fill_(1.0)
         model.head.weight.fill_(1.0)
@@ -115,6 +149,7 @@ def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
     optimizer = STAC(
         model,
         lr=0.1,
+        trunk_lr=0.1,
         last_n_layers=1,
         trunk_momentum=0.0,
         betas=(0.9, 0.99),
@@ -122,7 +157,7 @@ def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
         weight_decay=0.01,
     )
 
-    reference_parameter = nn.Parameter(torch.tensor([[1.0]]))
+    reference_parameter = nn.Parameter(torch.tensor([[1.0]], device=cuda_device))
     reference_optimizer = torch.optim.AdamW(
         [reference_parameter],
         lr=0.1,
@@ -134,9 +169,12 @@ def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
     expected_trunk = 1.0
     gradients = (0.2, 0.4)
     for gradient_value in gradients:
-        model.trunk.weight.grad = torch.tensor([[gradient_value]])
-        model.head.weight.grad = torch.tensor([[gradient_value]])
-        reference_parameter.grad = torch.tensor([[gradient_value]])
+        model.trunk.weight.grad = torch.tensor([[gradient_value]], device=cuda_device)
+        model.head.weight.grad = torch.tensor([[gradient_value]], device=cuda_device)
+        reference_parameter.grad = torch.tensor(
+            [[gradient_value]],
+            device=cuda_device,
+        )
 
         optimizer.step()
         reference_optimizer.step()
@@ -148,7 +186,7 @@ def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
 
     assert torch.allclose(
         model.trunk.weight.detach(),
-        torch.tensor([[expected_trunk]]),
+        torch.tensor([[expected_trunk]], device=cuda_device),
         atol=1e-6,
     )
     assert torch.allclose(
@@ -158,24 +196,27 @@ def test_trunk_uses_plain_signsgd_while_cap_matches_adamw() -> None:
     )
 
 
-def test_trunk_momentum_uses_sign_of_accumulated_gradient() -> None:
-    model = TwoLayerNet()
+def test_trunk_momentum_uses_sign_of_accumulated_gradient(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
     with torch.no_grad():
         model.trunk.weight.fill_(1.0)
 
     optimizer = STAC(
         model,
         lr=0.1,
+        trunk_lr=0.1,
         last_n_layers=1,
         trunk_momentum=0.5,
         weight_decay=0.01,
     )
 
-    model.trunk.weight.grad = torch.tensor([[1.0]])
+    model.trunk.weight.grad = torch.tensor([[1.0]], device=cuda_device)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
-    model.trunk.weight.grad = torch.tensor([[-0.1]])
+    model.trunk.weight.grad = torch.tensor([[-0.1]], device=cuda_device)
     optimizer.step()
 
     expected = 1.0
@@ -186,13 +227,15 @@ def test_trunk_momentum_uses_sign_of_accumulated_gradient() -> None:
 
     assert torch.allclose(
         model.trunk.weight.detach(),
-        torch.tensor([[expected]]),
+        torch.tensor([[expected]], device=cuda_device),
         atol=1e-6,
     )
 
 
-def test_role_specific_learning_rates_are_applied() -> None:
-    model = TwoLayerNet()
+def test_role_specific_learning_rates_are_applied(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
     with torch.no_grad():
         model.trunk.weight.fill_(1.0)
         model.head.weight.fill_(1.0)
@@ -206,23 +249,23 @@ def test_role_specific_learning_rates_are_applied() -> None:
         trunk_momentum=0.0,
     )
 
-    reference_parameter = nn.Parameter(torch.tensor([[1.0]]))
+    reference_parameter = nn.Parameter(torch.tensor([[1.0]], device=cuda_device))
     reference_optimizer = torch.optim.AdamW(
         [reference_parameter],
         lr=0.05,
         weight_decay=0.0,
     )
 
-    model.trunk.weight.grad = torch.tensor([[1.0]])
-    model.head.weight.grad = torch.tensor([[1.0]])
-    reference_parameter.grad = torch.tensor([[1.0]])
+    model.trunk.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    reference_parameter.grad = torch.tensor([[1.0]], device=cuda_device)
 
     optimizer.step()
     reference_optimizer.step()
 
     assert torch.allclose(
         model.trunk.weight.detach(),
-        torch.tensor([[0.8]]),
+        torch.tensor([[0.8]], device=cuda_device),
         atol=1e-6,
     )
     assert torch.allclose(
@@ -232,11 +275,13 @@ def test_role_specific_learning_rates_are_applied() -> None:
     )
 
 
-def test_state_dict_round_trip_preserves_optimizer_behavior() -> None:
+def test_state_dict_round_trip_preserves_optimizer_behavior(
+    cuda_device: torch.device,
+) -> None:
     torch.manual_seed(0)
-    model_a = TwoLayerNet()
+    model_a = TwoLayerNet().to(cuda_device)
     torch.manual_seed(0)
-    model_b = TwoLayerNet()
+    model_b = TwoLayerNet().to(cuda_device)
 
     optimizer_a = STAC(
         model_a,
@@ -255,17 +300,17 @@ def test_state_dict_round_trip_preserves_optimizer_behavior() -> None:
         weight_decay=0.01,
     )
 
-    model_a.trunk.weight.grad = torch.tensor([[0.4]])
-    model_a.head.weight.grad = torch.tensor([[0.4]])
+    model_a.trunk.weight.grad = torch.tensor([[0.4]], device=cuda_device)
+    model_a.head.weight.grad = torch.tensor([[0.4]], device=cuda_device)
     optimizer_a.step()
 
     model_b.load_state_dict(model_a.state_dict())
     optimizer_b.load_state_dict(deepcopy(optimizer_a.state_dict()))
 
-    model_a.trunk.weight.grad = torch.tensor([[-0.1]])
-    model_a.head.weight.grad = torch.tensor([[-0.1]])
-    model_b.trunk.weight.grad = torch.tensor([[-0.1]])
-    model_b.head.weight.grad = torch.tensor([[-0.1]])
+    model_a.trunk.weight.grad = torch.tensor([[-0.1]], device=cuda_device)
+    model_a.head.weight.grad = torch.tensor([[-0.1]], device=cuda_device)
+    model_b.trunk.weight.grad = torch.tensor([[-0.1]], device=cuda_device)
+    model_b.head.weight.grad = torch.tensor([[-0.1]], device=cuda_device)
 
     optimizer_a.step()
     optimizer_b.step()
@@ -282,6 +327,51 @@ def test_state_dict_round_trip_preserves_optimizer_behavior() -> None:
     )
 
 
+def test_amsgrad_cap_matches_torch_adamw(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    with torch.no_grad():
+        model.trunk.weight.fill_(1.0)
+        model.head.weight.fill_(1.0)
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_layers=2,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        weight_decay=0.01,
+        amsgrad=True,
+    )
+
+    reference_parameter = nn.Parameter(torch.tensor([[1.0]], device=cuda_device))
+    reference_optimizer = torch.optim.AdamW(
+        [reference_parameter],
+        lr=0.1,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        weight_decay=0.01,
+        amsgrad=True,
+    )
+
+    for gradient_value in (2.0, 0.1, 0.1):
+        model.head.weight.grad = torch.tensor([[gradient_value]], device=cuda_device)
+        reference_parameter.grad = torch.tensor(
+            [[gradient_value]],
+            device=cuda_device,
+        )
+
+        optimizer.step()
+        reference_optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+
+    assert torch.allclose(
+        model.head.weight.detach(),
+        reference_parameter.detach(),
+        atol=1e-6,
+    )
+
+
 def test_add_param_group_is_rejected() -> None:
     model = TwoLayerNet()
     optimizer = STAC(model)
@@ -291,10 +381,12 @@ def test_add_param_group_is_rejected() -> None:
         optimizer.add_param_group({"params": [extra_parameter]})
 
 
-def test_sparse_gradients_are_rejected_in_both_roles() -> None:
-    indices = torch.tensor([[0, 1], [2, 3]])
+def test_sparse_gradients_are_rejected_in_both_roles(
+    cuda_device: torch.device,
+) -> None:
+    indices = torch.tensor([[0, 1], [2, 3]], device=cuda_device)
 
-    trunk_model = SparseNet()
+    trunk_model = SparseNet().to(cuda_device)
     trunk_optimizer = STAC(trunk_model, lr=0.1, last_n_layers=1)
     trunk_loss = trunk_model(indices).sum()
     trunk_loss.backward()
@@ -302,7 +394,7 @@ def test_sparse_gradients_are_rejected_in_both_roles() -> None:
     with pytest.raises(RuntimeError, match="sparse gradients"):
         trunk_optimizer.step()
 
-    cap_model = SparseNet()
+    cap_model = SparseNet().to(cuda_device)
     cap_optimizer = STAC(cap_model, lr=0.1, last_n_layers=2)
     cap_loss = cap_model(indices).sum()
     cap_loss.backward()
@@ -311,8 +403,8 @@ def test_sparse_gradients_are_rejected_in_both_roles() -> None:
         cap_optimizer.step()
 
 
-def test_nonfinite_gradients_can_raise() -> None:
-    model = TwoLayerNet()
+def test_nonfinite_gradients_can_raise(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
     optimizer = STAC(
         model,
         lr=0.1,
@@ -320,8 +412,60 @@ def test_nonfinite_gradients_can_raise() -> None:
         error_if_nonfinite=True,
     )
 
-    model.trunk.weight.grad = torch.tensor([[float("nan")]])
-    model.head.weight.grad = torch.tensor([[1.0]])
+    model.trunk.weight.grad = torch.tensor([[float("nan")]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
 
     with pytest.raises(RuntimeError, match="non-finite gradients"):
         optimizer.step()
+
+
+def test_load_state_dict_rejects_partition_mismatch(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    stateful_optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    mismatched_optimizer = STAC(model, lr=0.1, last_n_layers=0)
+
+    with pytest.raises(ValueError, match="parameter groups"):
+        mismatched_optimizer.load_state_dict(stateful_optimizer.state_dict())
+
+
+def test_default_trunk_is_more_effective_than_plain_sign_on_cuda(
+    cuda_device: torch.device,
+) -> None:
+    def make_batch(seed: int) -> tuple[torch.Tensor, torch.Tensor]:
+        generator = torch.Generator().manual_seed(seed)
+        inputs = torch.randn(512, 16, generator=generator)
+        target_matrix = torch.randn(16, 4, generator=generator)
+        targets = inputs @ target_matrix + 0.1 * torch.randn(
+            512,
+            4,
+            generator=generator,
+        )
+        return inputs.to(cuda_device), targets.to(cuda_device)
+
+    def run_trial(seed: int, trunk_momentum: float) -> float:
+        inputs, targets = make_batch(seed)
+        torch.manual_seed(1234)
+        model = TinyBenchmarkNet().to(cuda_device)
+        optimizer = STAC(
+            model,
+            lr=3e-3,
+            last_n_layers=1,
+            trunk_momentum=trunk_momentum,
+            weight_decay=1e-2,
+        )
+
+        for _ in range(200):
+            optimizer.zero_grad(set_to_none=True)
+            predictions = model(inputs)
+            loss = torch.nn.functional.mse_loss(predictions, targets)
+            loss.backward()
+            optimizer.step()
+
+        return float(loss.detach().cpu())
+
+    default_losses = [run_trial(seed, trunk_momentum=0.9) for seed in range(3)]
+    plain_losses = [run_trial(seed, trunk_momentum=0.0) for seed in range(3)]
+
+    assert statistics.fmean(default_losses) < statistics.fmean(plain_losses) * 0.5
