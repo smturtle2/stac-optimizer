@@ -5,34 +5,26 @@
 [![Torch >= 2.10](https://img.shields.io/badge/torch-%3E%3D2.10-ee4c2c)](https://pytorch.org/)
 [![CI](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml/badge.svg)](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml)
 
-[한국어 README](https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md)
+[Korean README](https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md) |
+[Optimizer docs](https://github.com/smturtle2/stac-optimizer/blob/main/docs/en/optimizer.md) |
+[Korean docs](https://github.com/smturtle2/stac-optimizer/blob/main/docs/ko/optimizer.md) |
+[Benchmark JSON](https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json)
 
-It is a PyTorch optimizer that keeps the earlier trainable modules on
-momentum-stabilized sign updates and the last `N` trainable modules on AdamW.
-The goal is simple: keep optimizer-state VRAM lower than full AdamW while
-preserving strong optimization behavior where adaptive updates matter most.
+STAC keeps earlier trainable modules on momentum-stabilized sign updates and
+the last `N` trainable modules on AdamW. The target is practical: lower
+optimizer-state VRAM than full AdamW without giving up useful adaptivity on the
+final trainable modules.
 
 | Item | Value |
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
 | Default split | last `1` trainable module uses AdamW |
-| Sign-updated section | decoupled weight decay + `sign(EMA(grad))` |
-| AdamW section | AdamW with decoupled weight decay |
-| Extra VRAM knob | `sign_state_dtype=torch.bfloat16` |
-| Validation | local CUDA test suite + research benchmark |
+| Stability knobs | `sign_momentum`, `sign_lr_scale`, `error_if_nonfinite` |
+| VRAM knob | `sign_state_dtype="auto"` or `"bf16"` |
+| Partition inspection | `optimizer.partition.sign_module_names`, `optimizer.partition.adamw_module_names` |
 
-## Optimizer Layout
-
-```mermaid
-flowchart LR
-    A[Trainable modules in registration order] --> B[Earlier trainable modules]
-    A --> C[Last N trainable modules]
-    B --> D[Sign-updated section<br/>decoupled weight decay<br/>EMA grad then sign update<br/>optional bf16 state]
-    C --> E[AdamW section<br/>decoupled weight decay]
-```
-
-## Installation
+## Install
 
 ```bash
 python -m pip install stac-optimizer
@@ -65,119 +57,53 @@ optimizer = STAC(
     model,
     lr=1e-3,
     last_n_modules=1,
+    sign_lr_scale=0.75,
     sign_momentum=0.9,
+    sign_state_dtype="bf16",
     weight_decay=1e-2,
-    sign_state_dtype=torch.bfloat16,
     error_if_nonfinite=True,
 )
 
-inputs = torch.randn(8, 128)
-targets = torch.randn(8, 10)
-
-loss = torch.nn.functional.mse_loss(model(inputs), targets)
+loss = torch.nn.functional.mse_loss(
+    model(torch.randn(8, 128)),
+    torch.randn(8, 10),
+)
 loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 
-print("sign modules:", optimizer.partition.sign_module_names)
-print("adamw modules:", optimizer.partition.adamw_module_names)
+print(optimizer.partition.sign_module_names)
+print(optimizer.partition.adamw_module_names)
 ```
 
-`last_n_modules` counts modules that directly own trainable parameters. Pure
-containers such as `nn.Sequential` are skipped unless they own parameters
+`last_n_modules` counts only modules that directly own trainable parameters.
+Pure containers such as `nn.Sequential` are skipped unless they own parameters
 themselves.
 
-## Why This Design
+## CUDA Benchmark
 
-- [signSGD: Compressed Optimisation for Non-Convex Problems](https://arxiv.org/abs/1802.04434)
-  motivates sign-based updates as a low-state alternative to adaptive methods.
-- [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html)
-  supports using momentum before taking the sign instead of raw `sign(grad)`.
-- [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101)
-  supports the AdamW-style decoupled decay used in the final section.
-- [Deconstructing What Makes a Good Optimizer for Autoregressive Language Models](https://openreview.net/forum?id=zfeso8ceqr)
-  argues that much of the benefit of adaptivity can come from a small subset of
-  parameters, which is the main motivation for concentrating AdamW in the final
-  section.
-
-STAC intentionally exposes a single public learning-rate knob. In mixed mode it
-keeps the earlier sign-updated section slightly more conservative internally,
-which performed more reliably than a fully matched rate on this repository's
-held-out CUDA study.
-
-## CUDA Research Benchmark
-
-Primary benchmark script:
-[examples/research_benchmark.py](https://github.com/smturtle2/stac-optimizer/blob/main/examples/research_benchmark.py)
-
-Machine-readable report:
-[docs/benchmark/research_benchmark.json](https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json)
-
-Methodology:
-
-- CUDA only
-- separate train/validation splits
-- `5` seeds
-- `12` epochs and `20` updates per epoch
-- reports epoch-by-epoch validation loss curves
-- measures optimizer state plus peak CUDA allocated/reserved memory on first step
-
-Snapshot from `2026-03-19` on `torch 2.10.0+cu126` and `NVIDIA GeForce RTX 3070`:
+The repository benchmark uses separate train/validation splits, `5` paired
+seeds, per-trial model initialization matched across optimizers, epoch-by-epoch
+validation loss curves, and a first-step CUDA memory probe.
 
 ![STAC CUDA research benchmark](https://raw.githubusercontent.com/smturtle2/stac-optimizer/main/docs/benchmark/research_benchmark.png)
 
-Regression validation loss:
+Latest snapshot from `2026-03-19` on `torch 2.10.0+cu126` and
+`NVIDIA GeForce RTX 3070`:
 
-| Optimizer | Final val loss mean | Final val loss range |
-| --- | ---: | ---: |
-| `STAC` default (`last_n_modules=1`) | `0.045901` | `0.044386 - 0.047512` |
-| `STAC` wider AdamW section (`last_n_modules=2`) | `0.044885` | `0.044014 - 0.046273` |
-| `STAC` plain sign update | `0.043162` | `0.041903 - 0.044614` |
-| `AdamW` baseline | `0.043753` | `0.042771 - 0.045108` |
+| Config | Regression val loss | Classification val loss | Classification val acc | Optimizer state MB |
+| --- | ---: | ---: | ---: | ---: |
+| `STAC` default (`last_n_modules=1`) | `0.045115` | `0.278679` | `0.9016` | `3.637` |
+| `STAC` wider AdamW section (`last_n_modules=2`) | `0.044285` | `0.281579` | `0.9039` | `3.762` |
+| `STAC` bf16 sign state | `0.045177` | `0.281705` | `0.9004` | `1.821` |
+| `AdamW` baseline | `0.043068` | `0.280832` | `0.9055` | `7.270` |
 
-Classification validation:
+In this run, the default STAC configuration used about half the optimizer state
+of AdamW, and the BF16 sign-state variant reduced that state again with only a
+small quality delta. Full methodology and all ablations live in the linked docs
+and JSON report.
 
-| Optimizer | Final val loss mean | Final val loss range | Final val acc mean |
-| --- | ---: | ---: | ---: |
-| `STAC` default (`last_n_modules=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
-| `STAC` wider AdamW section (`last_n_modules=2`) | `0.311801` | `0.285143 - 0.320327` | `0.8918` |
-| `STAC` plain sign update | `0.314426` | `0.279694 - 0.330161` | `0.9039` |
-| `AdamW` baseline | `0.304733` | `0.275815 - 0.317797` | `0.9074` |
-
-Memory probe:
-
-| Optimizer | Optimizer state MB | Peak allocated MB | Peak reserved MB |
-| --- | ---: | ---: | ---: |
-| `STAC` default (`last_n_modules=1`) | `3.637` | `31.925` | `38.000` |
-| `STAC` wider AdamW section (`last_n_modules=2`) | `3.762` | `31.674` | `38.000` |
-| `STAC` plain sign update | `0.004` | `28.292` | `34.000` |
-| `AdamW` baseline | `7.270` | `35.565` | `40.000` |
-
-This benchmark is evidence, not a universal leaderboard. It is meant to answer
-two practical questions for this repository:
-
-- Does STAC remain competitive with AdamW on held-out CUDA tasks?
-- Does STAC reduce optimizer-state and peak-memory pressure in practice?
-
-## Public API
-
-The package exports:
-
-- `STAC`
-- `partition_trainable_modules(model, last_n_modules=1)`
-- `ModuleGroup`
-- `STACPartition`
-
-Useful runtime guarantees:
-
-- deterministic sign/AdamW partitioning based on direct trainable modules in `model.named_modules()`
-- explicit rejection of sparse gradients
-- whole-step skip on non-finite dense gradients unless
-  `error_if_nonfinite=True`
-- checkpoint validation against saved module names, parameter names, and state
-  tensor shapes
-
-## Verification
+## Verify
 
 ```bash
 python -m pytest -q
@@ -185,8 +111,3 @@ python -m build
 python -m twine check dist/*
 python examples/research_benchmark.py --device cuda
 ```
-
-The repository also keeps the older quick smoke benchmark at
-[examples/toy_benchmark.py](https://github.com/smturtle2/stac-optimizer/blob/main/examples/toy_benchmark.py)
-for fast sanity checks, but the research benchmark above is the primary CUDA
-evidence for README claims.

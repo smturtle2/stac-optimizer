@@ -1,31 +1,28 @@
 # stac-optimizer
 
-[English README](https://github.com/smturtle2/stac-optimizer/blob/main/README.md)
+[![PyPI version](https://img.shields.io/pypi/v/stac-optimizer)](https://pypi.org/project/stac-optimizer/)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue)](https://www.python.org/downloads/release/python-3130/)
+[![Torch >= 2.10](https://img.shields.io/badge/torch-%3E%3D2.10-ee4c2c)](https://pytorch.org/)
+[![CI](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml/badge.svg)](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml)
 
-앞쪽 학습 모듈은 momentum-stabilized sign 업데이트로, 마지막 `N`개 학습
-모듈은 AdamW로 유지하는 PyTorch 옵티마이저입니다. 목표는 전체를
-AdamW로 돌릴 때보다 optimizer state VRAM을 줄이면서도, 적응형 업데이트가
-중요한 구간에서는 성능을 잃지 않는 것입니다.
+[English README](https://github.com/smturtle2/stac-optimizer/blob/main/README.md) |
+[영문 문서](https://github.com/smturtle2/stac-optimizer/blob/main/docs/en/optimizer.md) |
+[한국어 문서](https://github.com/smturtle2/stac-optimizer/blob/main/docs/ko/optimizer.md) |
+[벤치마크 JSON](https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json)
+
+STAC는 앞쪽 학습 모듈은 momentum-stabilized sign 업데이트로, 마지막 `N`개
+학습 모듈은 AdamW로 유지하는 PyTorch 옵티마이저입니다. 목표는 전체 AdamW보다
+optimizer-state VRAM을 낮추면서도 마지막 핵심 모듈의 adaptivity는 유지하는
+것입니다.
 
 | 항목 | 값 |
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
 | 기본 분할 | 마지막 `1`개 학습 모듈만 AdamW |
-| sign 업데이트 구간 | decoupled weight decay + `sign(EMA(grad))` |
-| AdamW 구간 | AdamW + decoupled weight decay |
-| 추가 VRAM 옵션 | `sign_state_dtype=torch.bfloat16` |
-| 검증 | 로컬 CUDA 테스트 + 연구용 CUDA 벤치마크 |
-
-## 구조
-
-```mermaid
-flowchart LR
-    A[등록 순서의 학습 모듈] --> B[앞쪽 학습 모듈]
-    A --> C[마지막 N개 학습 모듈]
-    B --> D[sign 업데이트 구간<br/>decoupled weight decay<br/>EMA grad 후 sign update<br/>optional bf16 state]
-    C --> E[AdamW 구간<br/>decoupled weight decay]
-```
+| 안정성 조절 | `sign_momentum`, `sign_lr_scale`, `error_if_nonfinite` |
+| VRAM 조절 | `sign_state_dtype="auto"` 또는 `"bf16"` |
+| 분할 확인 | `optimizer.partition.sign_module_names`, `optimizer.partition.adamw_module_names` |
 
 ## 설치
 
@@ -60,9 +57,10 @@ optimizer = STAC(
     model,
     lr=1e-3,
     last_n_modules=1,
+    sign_lr_scale=0.75,
     sign_momentum=0.9,
+    sign_state_dtype="bf16",
     weight_decay=1e-2,
-    sign_state_dtype=torch.bfloat16,
     error_if_nonfinite=True,
 )
 
@@ -74,100 +72,34 @@ loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 
-print("sign modules:", optimizer.partition.sign_module_names)
-print("adamw modules:", optimizer.partition.adamw_module_names)
+print(optimizer.partition.sign_module_names)
+print(optimizer.partition.adamw_module_names)
 ```
 
 `last_n_modules`는 trainable parameter를 직접 소유한 모듈만 셉니다.
 `nn.Sequential` 같은 순수 컨테이너는 자기 자신이 parameter를 직접 갖지 않으면
 자동으로 건너뜁니다.
 
-## 설계 근거
+## CUDA 벤치마크
 
-- [signSGD: Compressed Optimisation for Non-Convex Problems](https://arxiv.org/abs/1802.04434)
-  는 sign 기반 업데이트가 낮은 상태 메모리 대안이 될 수 있음을 보여줍니다.
-- [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html)
-  는 raw `sign(grad)`보다 momentum 뒤에 sign을 취하는 쪽이 더 안정적임을
-  뒷받침합니다.
-- [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101)
-  은 마지막 AdamW 구간에서 decoupled weight decay를 쓰는 근거입니다.
-- [Deconstructing What Makes a Good Optimizer for Autoregressive Language Models](https://openreview.net/forum?id=zfeso8ceqr)
-  는 적응형 업데이트의 이점이 소수 파라미터에 집중될 수 있음을 보여주며,
-  adaptivity를 마지막 구간에 집중시키는 동기를 제공합니다.
-
-STAC는 공개 학습률 파라미터를 `lr` 하나만 둡니다. mixed mode에서는 앞쪽
-sign 업데이트 구간을 내부적으로 조금 더 보수적으로 다루며, 이 저장소의
-held-out CUDA 실험에서는 이쪽이 완전 동일 학습률보다 더 안정적이었습니다.
-
-## CUDA 연구용 벤치마크
-
-주요 벤치마크 스크립트:
-[examples/research_benchmark.py](https://github.com/smturtle2/stac-optimizer/blob/main/examples/research_benchmark.py)
-
-JSON 결과:
-[docs/benchmark/research_benchmark.json](https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json)
-
-방법론:
-
-- CUDA 전용
-- train/validation 분리
-- `5`개 시드
-- `12` epoch, epoch당 `20` step
-- epoch별 validation loss curve 기록
-- 첫 step에서 optimizer state와 peak CUDA allocated/reserved memory 측정
-
-`2026-03-19` 스냅샷, `torch 2.10.0+cu126`, `NVIDIA GeForce RTX 3070`:
+이 저장소의 연구용 벤치마크는 train/validation 분리, `5`개 paired seed,
+optimizer 간 동일한 trial seed 기반 모델 초기화, epoch별 validation loss
+curve, 첫 step CUDA 메모리 probe를 사용합니다.
 
 ![STAC CUDA research benchmark](https://raw.githubusercontent.com/smturtle2/stac-optimizer/main/docs/benchmark/research_benchmark.png)
 
-회귀 validation loss:
+`2026-03-19`, `torch 2.10.0+cu126`, `NVIDIA GeForce RTX 3070` 스냅샷:
 
-| 옵티마이저 | 최종 val loss 평균 | 최종 val loss 범위 |
-| --- | ---: | ---: |
-| `STAC` 기본 (`last_n_modules=1`) | `0.045901` | `0.044386 - 0.047512` |
-| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `0.044885` | `0.044014 - 0.046273` |
-| `STAC` plain sign update | `0.043162` | `0.041903 - 0.044614` |
-| `AdamW` baseline | `0.043753` | `0.042771 - 0.045108` |
+| 설정 | 회귀 val loss | 분류 val loss | 분류 val acc | Optimizer state MB |
+| --- | ---: | ---: | ---: | ---: |
+| `STAC` 기본 (`last_n_modules=1`) | `0.045115` | `0.278679` | `0.9016` | `3.637` |
+| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `0.044285` | `0.281579` | `0.9039` | `3.762` |
+| `STAC` bf16 sign state | `0.045177` | `0.281705` | `0.9004` | `1.821` |
+| `AdamW` baseline | `0.043068` | `0.280832` | `0.9055` | `7.270` |
 
-분류 validation:
-
-| 옵티마이저 | 최종 val loss 평균 | 최종 val loss 범위 | 최종 val acc 평균 |
-| --- | ---: | ---: | ---: |
-| `STAC` 기본 (`last_n_modules=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
-| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `0.311801` | `0.285143 - 0.320327` | `0.8918` |
-| `STAC` plain sign update | `0.314426` | `0.279694 - 0.330161` | `0.9039` |
-| `AdamW` baseline | `0.304733` | `0.275815 - 0.317797` | `0.9074` |
-
-메모리 probe:
-
-| 옵티마이저 | Optimizer state MB | Peak allocated MB | Peak reserved MB |
-| --- | ---: | ---: | ---: |
-| `STAC` 기본 (`last_n_modules=1`) | `3.637` | `31.925` | `38.000` |
-| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `3.762` | `31.674` | `38.000` |
-| `STAC` plain sign update | `0.004` | `28.292` | `34.000` |
-| `AdamW` baseline | `7.270` | `35.565` | `40.000` |
-
-이 벤치마크는 리더보드가 아니라, 이 저장소의 실제 질문 두 개에 답하기 위한
-근거입니다.
-
-- STAC가 held-out CUDA 태스크에서 AdamW와 경쟁력이 있는가
-- STAC가 실제로 optimizer state와 peak memory 부담을 줄이는가
-
-## 공개 API
-
-패키지는 다음을 export합니다.
-
-- `STAC`
-- `partition_trainable_modules(model, last_n_modules=1)`
-- `ModuleGroup`
-- `STACPartition`
-
-실사용에서 중요한 보장:
-
-- `model.named_modules()`에서 trainable parameter를 직접 가진 모듈 기준의 결정적 sign/AdamW 분할
-- sparse gradient 명시적 거부
-- `error_if_nonfinite=False`일 때 non-finite dense gradient step 전체 skip
-- state_dict 로드 시 module name, parameter name, state tensor shape 검증
+이번 측정에서 기본 STAC는 AdamW 대비 optimizer state를 대략 절반 수준으로
+줄였고, BF16 sign-state 변형은 이를 다시 한 번 더 낮췄습니다. 전체 방법론과
+추가 ablation은 연결된 문서와 JSON 보고서에 정리했습니다.
 
 ## 검증
 
@@ -177,7 +109,3 @@ python -m build
 python -m twine check dist/*
 python examples/research_benchmark.py --device cuda
 ```
-
-빠른 smoke check 용도의 기존 스크립트
-[examples/toy_benchmark.py](https://github.com/smturtle2/stac-optimizer/blob/main/examples/toy_benchmark.py)
-도 유지하지만, README의 핵심 근거는 위 research benchmark 기준입니다.

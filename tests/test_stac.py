@@ -134,7 +134,10 @@ def run_benchmark_trial(
     else:
         raise ValueError(f"Unknown task kind: {task_kind}.")
 
-    torch.manual_seed(1234)
+    trial_seed = 1_234 + seed
+    torch.manual_seed(trial_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(trial_seed)
     model = TinyBenchmarkNet().to(device)
     optimizer = STAC(
         model,
@@ -242,11 +245,29 @@ def test_default_hybrid_sign_group_lr_is_scaled_down() -> None:
     assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
 
 
+def test_custom_sign_lr_scale_is_applied_to_hybrid_sign_group() -> None:
+    model = TwoLayerNet()
+
+    optimizer = STAC(model, lr=0.1, last_n_modules=1, sign_lr_scale=0.5)
+
+    assert optimizer.sign_lr_scale == pytest.approx(0.5)
+    assert optimizer.param_groups[0]["stac_role"] == "sign"
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
+    assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
+
+
 def test_negative_last_n_modules_is_rejected() -> None:
     model = StackedNet()
 
     with pytest.raises(ValueError, match="last_n_modules"):
         STAC(model, last_n_modules=-1)
+
+
+def test_nonpositive_sign_lr_scale_is_rejected() -> None:
+    model = StackedNet()
+
+    with pytest.raises(ValueError, match="sign_lr_scale"):
+        STAC(model, sign_lr_scale=0.0)
 
 
 def test_last_n_modules_is_stored_on_optimizer() -> None:
@@ -571,6 +592,31 @@ def test_sign_state_dtype_can_use_bfloat16(cuda_device: torch.device) -> None:
     )
 
 
+def test_auto_sign_state_dtype_uses_fp32_for_bfloat16_parameters(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(device=cuda_device, dtype=torch.bfloat16)
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_modules=0,
+        sign_momentum=0.9,
+    )
+
+    model.base.weight.grad = torch.tensor([[1.0]], device=cuda_device).to(torch.bfloat16)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device).to(torch.bfloat16)
+    optimizer.step()
+
+    assert (
+        optimizer.state[model.base.weight]["sign_momentum_buffer"].dtype
+        == torch.float32
+    )
+    assert (
+        optimizer.state[model.head.weight]["sign_momentum_buffer"].dtype
+        == torch.float32
+    )
+
+
 def test_amsgrad_adamw_section_matches_torch_adamw(cuda_device: torch.device) -> None:
     model = TwoLayerNet().to(cuda_device)
     with torch.no_grad():
@@ -612,6 +658,72 @@ def test_amsgrad_adamw_section_matches_torch_adamw(cuda_device: torch.device) ->
     assert torch.allclose(
         model.head.weight.detach(),
         reference_parameter.detach(),
+        atol=1e-6,
+    )
+
+
+def test_foreach_true_matches_default_single_tensor_paths(
+    cuda_device: torch.device,
+) -> None:
+    torch.manual_seed(0)
+    default_model = TwoLayerNet().to(cuda_device)
+    torch.manual_seed(0)
+    foreach_model = TwoLayerNet().to(cuda_device)
+
+    default_optimizer = STAC(
+        default_model,
+        lr=0.1,
+        last_n_modules=1,
+        sign_momentum=0.8,
+        betas=(0.9, 0.99),
+        weight_decay=0.01,
+        foreach=False,
+    )
+    foreach_optimizer = STAC(
+        foreach_model,
+        lr=0.1,
+        last_n_modules=1,
+        sign_momentum=0.8,
+        betas=(0.9, 0.99),
+        weight_decay=0.01,
+        foreach=True,
+    )
+
+    gradients = (0.4, -0.1, 0.2)
+    for gradient_value in gradients:
+        for model in (default_model, foreach_model):
+            model.base.weight.grad = torch.tensor(
+                [[gradient_value]],
+                device=cuda_device,
+            )
+            model.head.weight.grad = torch.tensor(
+                [[gradient_value]],
+                device=cuda_device,
+            )
+
+        default_optimizer.step()
+        foreach_optimizer.step()
+        default_optimizer.zero_grad(set_to_none=True)
+        foreach_optimizer.zero_grad(set_to_none=True)
+
+    assert torch.allclose(
+        default_model.base.weight.detach(),
+        foreach_model.base.weight.detach(),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        default_model.head.weight.detach(),
+        foreach_model.head.weight.detach(),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        default_optimizer.state[default_model.base.weight]["sign_momentum_buffer"],
+        foreach_optimizer.state[foreach_model.base.weight]["sign_momentum_buffer"],
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        default_optimizer.state[default_model.head.weight]["exp_avg"],
+        foreach_optimizer.state[foreach_model.head.weight]["exp_avg"],
         atol=1e-6,
     )
 

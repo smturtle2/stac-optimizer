@@ -23,7 +23,9 @@ class BenchmarkConfig:
     optimizer_kind: str
     lr: float = 3e-3
     last_n_modules: int = 1
+    sign_lr_scale: float = 0.75
     sign_momentum: float = 0.9
+    sign_state_dtype: str | None = None
     weight_decay: float = 1e-2
 
 
@@ -111,7 +113,9 @@ def build_optimizer(
             model,
             lr=config.lr,
             last_n_modules=config.last_n_modules,
+            sign_lr_scale=config.sign_lr_scale,
             sign_momentum=config.sign_momentum,
+            sign_state_dtype=config.sign_state_dtype,
             weight_decay=config.weight_decay,
         )
     if config.optimizer_kind == "adamw":
@@ -140,7 +144,10 @@ def run_trial(
     else:
         raise ValueError(f"Unknown task kind: {task_kind}.")
 
-    torch.manual_seed(1234)
+    trial_seed = 1_234 + seed
+    torch.manual_seed(trial_seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(trial_seed)
     model = ToyMLP().to(device)
     optimizer = build_optimizer(model, config)
 

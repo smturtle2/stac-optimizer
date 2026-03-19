@@ -30,10 +30,12 @@ class BenchmarkConfig:
     optimizer_kind: str
     lr: float = 2e-3
     last_n_modules: int = 1
+    sign_lr_scale: float = 0.75
     sign_momentum: float = 0.9
+    sign_state_dtype: str | None = None
     weight_decay: float = 1e-2
     color: str = "#1f77b4"
-    linestyle: str = "-"
+    linestyle: str | tuple[int, tuple[int, ...]] = "-"
 
 
 @dataclass(frozen=True)
@@ -101,6 +103,40 @@ class ClassificationStudent(nn.Module):
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.Linear(32, 4),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
+
+
+class LayerNormClassificationTeacher(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.Tanh(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 5),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
+
+
+class LayerNormClassificationStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(32, 96),
+            nn.GELU(),
+            nn.LayerNorm(96),
+            nn.Linear(96, 64),
+            nn.GELU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 5),
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -201,6 +237,37 @@ def make_classification_data(
     )
 
 
+@torch.no_grad()
+def make_layernorm_classification_data(
+    seed: int,
+    *,
+    task: TaskConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    train_inputs = torch.randn(task.train_samples, task.input_dim, generator=generator)
+    val_inputs = torch.randn(task.val_samples, task.input_dim, generator=generator)
+    teacher = LayerNormClassificationTeacher()
+    train_targets = teacher(train_inputs).argmax(dim=1)
+    val_targets = teacher(val_inputs).argmax(dim=1)
+
+    label_noise = torch.rand(task.train_samples, generator=generator) < 0.10
+    noisy_labels = torch.randint(
+        0,
+        5,
+        size=(int(label_noise.sum().item()),),
+        generator=generator,
+    )
+    train_targets[label_noise] = noisy_labels
+
+    return (
+        train_inputs.to(device),
+        train_targets.to(device),
+        val_inputs.to(device),
+        val_targets.to(device),
+    )
+
+
 def batch_indices(
     num_samples: int,
     *,
@@ -224,7 +291,9 @@ def build_optimizer(
             model,
             lr=config.lr,
             last_n_modules=config.last_n_modules,
+            sign_lr_scale=config.sign_lr_scale,
             sign_momentum=config.sign_momentum,
+            sign_state_dtype=config.sign_state_dtype,
             weight_decay=config.weight_decay,
         )
     if config.optimizer_kind == "adamw":
@@ -291,7 +360,7 @@ def run_regression_trial(
         seed=10_000 + seed,
     )
 
-    seed_all(100)
+    seed_all(30_000 + seed)
     model = RegressionStudent().to(device)
     optimizer = build_optimizer(model, config)
 
@@ -338,8 +407,61 @@ def run_classification_trial(
         seed=20_000 + seed,
     )
 
-    seed_all(100)
+    seed_all(40_000 + seed)
     model = ClassificationStudent().to(device)
+    optimizer = build_optimizer(model, config)
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_accuracies: list[float] = []
+
+    for epoch in range(task.epochs):
+        epoch_losses: list[float] = []
+        offset = epoch * task.steps_per_epoch
+        for batch_index in schedule[offset : offset + task.steps_per_epoch]:
+            index = batch_index.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(train_inputs[index])
+            loss = torch.nn.functional.cross_entropy(logits, train_targets[index])
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(float(loss.detach().cpu()))
+
+        train_losses.append(statistics.fmean(epoch_losses))
+        metrics = evaluate_classification(model, val_inputs, val_targets)
+        val_losses.append(metrics["loss"])
+        val_accuracies.append(metrics["accuracy"])
+
+    return {
+        "train_loss": train_losses,
+        "val_loss": val_losses,
+        "val_accuracy": val_accuracies,
+    }
+
+
+def run_layernorm_classification_trial(
+    seed: int,
+    *,
+    config: BenchmarkConfig,
+    task: TaskConfig,
+    device: torch.device,
+) -> dict[str, list[float]]:
+    train_inputs, train_targets, val_inputs, val_targets = (
+        make_layernorm_classification_data(
+            seed,
+            task=task,
+            device=device,
+        )
+    )
+    schedule = batch_indices(
+        task.train_samples,
+        batch_size=task.batch_size,
+        steps=task.steps_per_epoch * task.epochs,
+        seed=30_000 + seed,
+    )
+
+    seed_all(50_000 + seed)
+    model = LayerNormClassificationStudent().to(device)
     optimizer = build_optimizer(model, config)
 
     train_losses: list[float] = []
@@ -429,6 +551,17 @@ def benchmark_task(
             epochs=epochs,
         )
         runner = run_classification_trial
+    elif task_name == "layernorm_classification":
+        task = TaskConfig(
+            name=task_name,
+            train_samples=4096,
+            val_samples=512,
+            input_dim=32,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            epochs=epochs,
+        )
+        runner = run_layernorm_classification_trial
     else:
         raise ValueError(f"Unknown task: {task_name}.")
 
@@ -498,8 +631,17 @@ def render_plot(
     configs: list[BenchmarkConfig],
     output_path: Path,
 ) -> None:
-    figure, axes = plt.subplots(1, 2, figsize=(13, 4.8), dpi=180)
-    for axis, task_name in zip(axes, ("regression", "classification"), strict=True):
+    task_names = tuple(benchmark_results["tasks"])
+    figure, axes = plt.subplots(
+        1,
+        len(task_names),
+        figsize=(5.7 * len(task_names), 4.8),
+        dpi=180,
+    )
+    if len(task_names) == 1:
+        axes = [axes]
+
+    for axis, task_name in zip(axes, task_names, strict=True):
         task_results = benchmark_results["tasks"][task_name]["configs"]
         epochs = list(
             range(
@@ -525,7 +667,7 @@ def render_plot(
                 alpha=0.12,
             )
 
-        axis.set_title(f"{task_name.title()} Validation Loss")
+        axis.set_title(f"{task_name.replace('_', ' ').title()} Validation Loss")
         axis.set_xlabel("Epoch")
         axis.set_ylabel("Loss")
         axis.grid(alpha=0.25, linewidth=0.7)
@@ -536,7 +678,7 @@ def render_plot(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.99),
-        ncol=2,
+        ncol=3,
         frameon=False,
         fontsize=10,
     )
@@ -550,8 +692,10 @@ def print_task_summary(
     task_name: str,
     task_results: dict[str, Any],
 ) -> None:
-    print(f"\n## {task_name}")
-    if task_name == "classification":
+    print(f"\n## {task_name.replace('_', ' ')}")
+    sample_summary = next(iter(task_results["configs"].values()))["summary"]
+    has_accuracy = "final_val_accuracy_mean" in sample_summary
+    if has_accuracy:
         print("| Optimizer | Final val loss mean | Final val loss range | Final val acc mean |")
         print("| --- | ---: | ---: | ---: |")
     else:
@@ -564,7 +708,7 @@ def print_task_summary(
             f"{summary['final_val_loss_min']:.6f} - "
             f"{summary['final_val_loss_max']:.6f}"
         )
-        if task_name == "classification":
+        if has_accuracy:
             print(
                 f"| {label} | {summary['final_val_loss_mean']:.6f} | "
                 f"{loss_range} | {summary['final_val_accuracy_mean']:.4f} |"
@@ -668,17 +812,24 @@ def main() -> None:
             linestyle="-.",
         ),
         BenchmarkConfig(
+            label="STAC bf16 sign state",
+            optimizer_kind="stac",
+            sign_state_dtype="bf16",
+            color="#7c3aed",
+            linestyle="--",
+        ),
+        BenchmarkConfig(
             label="STAC plain sign update",
             optimizer_kind="stac",
             sign_momentum=0.0,
-            color="#9333ea",
-            linestyle="--",
+            color="#b45309",
+            linestyle=":",
         ),
         BenchmarkConfig(
             label="AdamW baseline",
             optimizer_kind="adamw",
-            color="#1d4ed8",
-            linestyle=":",
+            color="#2563eb",
+            linestyle=(0, (5, 2)),
         ),
     ]
 
@@ -688,6 +839,11 @@ def main() -> None:
         f"epochs={args.epochs} steps_per_epoch={args.steps_per_epoch}"
     )
 
+    task_names = (
+        "regression",
+        "classification",
+        "layernorm_classification",
+    )
     tasks = {
         task_name: benchmark_task(
             task_name,
@@ -698,7 +854,7 @@ def main() -> None:
             batch_size=args.batch_size,
             device=device,
         )
-        for task_name in ("regression", "classification")
+        for task_name in task_names
     }
     memory = measure_peak_memory(
         configs=configs,
@@ -717,6 +873,8 @@ def main() -> None:
             "steps_per_epoch": args.steps_per_epoch,
             "batch_size": args.batch_size,
             "memory_batch_size": args.memory_batch_size,
+            "model_init_seed_policy": "per-trial seed matched across optimizers",
+            "task_names": list(task_names),
             "plot_path": str(plot_path),
             "json_path": str(json_path),
         },

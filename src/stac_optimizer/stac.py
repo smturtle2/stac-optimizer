@@ -9,7 +9,8 @@ from torch import nn
 from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
-_HYBRID_SIGN_LR_SCALE = 0.75
+_DEFAULT_SIGN_LR_SCALE = 0.75
+_AUTO_SIGN_STATE_DTYPE = "auto"
 _SIGN_STATE_DTYPE_ALIASES = {
     "float16": torch.float16,
     "half": torch.float16,
@@ -182,14 +183,23 @@ class STAC(Optimizer):
     are usually the parameterized end modules users care about, such as
     ``stem``, ``block.0``, ``block.2``, and ``head``.
 
-    When both sections are active, STAC internally uses ``0.75 * lr`` for the
-    sign-based section and ``lr`` for the AdamW section. This keeps the sign
-    path slightly more conservative while preserving a single public learning
-    rate knob.
+    When both sections are active, STAC internally uses
+    ``sign_lr_scale * lr`` for the sign-based section and ``lr`` for the
+    AdamW section. The default ``sign_lr_scale=0.75`` keeps the sign path
+    slightly more conservative while preserving a single public learning rate
+    knob.
 
-    The sign-based section can keep its momentum buffer in a lower-precision
-    floating dtype via ``sign_state_dtype``. This is useful when you want to
-    reduce optimizer-state VRAM further without changing the AdamW behavior.
+    The sign-based section can keep its momentum buffer in a configurable
+    floating dtype via ``sign_state_dtype``. By default STAC uses an ``"auto"``
+    policy: low-precision parameter tensors (``float16`` or ``bfloat16``) keep
+    their sign momentum state in ``float32`` for stability, while higher
+    precision tensors match the parameter dtype. You can still force a lower
+    precision state such as ``torch.bfloat16`` when VRAM matters more.
+
+    By default STAC uses single-tensor step logic instead of PyTorch's
+    ``foreach`` optimizer path. This keeps peak CUDA memory more conservative.
+    Set ``foreach=True`` when step throughput matters more than temporary
+    tensor-list overhead.
 
     With the default ``error_if_nonfinite=False``, STAC skips the entire step
     when it encounters a non-finite dense gradient. This avoids silently
@@ -209,8 +219,9 @@ class STAC(Optimizer):
         *,
         lr: float = 1e-3,
         last_n_modules: int = 1,
+        sign_lr_scale: float = _DEFAULT_SIGN_LR_SCALE,
         sign_momentum: float = 0.9,
-        sign_state_dtype: torch.dtype | str | None = None,
+        sign_state_dtype: torch.dtype | str | None = _AUTO_SIGN_STATE_DTYPE,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
@@ -219,21 +230,29 @@ class STAC(Optimizer):
         amsgrad: bool = False,
         maximize: bool = False,
         error_if_nonfinite: bool = False,
+        foreach: bool = False,
     ) -> None:
         """Create a STAC optimizer from a model.
 
         Args:
             model: Module whose trainable parameters should be optimized.
             lr: Shared base learning rate. In hybrid mode, STAC internally uses
-                ``0.75 * lr`` for the sign-based section and ``lr`` for the
-                AdamW section.
+                ``sign_lr_scale * lr`` for the sign-based section and ``lr``
+                for the AdamW section.
             last_n_modules: Number of final trainable modules that should use
                 AdamW. Earlier trainable modules use the sign-based section.
+            sign_lr_scale: Multiplicative factor applied to ``lr`` for the
+                sign-based section when both sections are active. The default
+                ``0.75`` is slightly more conservative than the AdamW section
+                and tested well on this repository's held-out CUDA suite.
             sign_momentum: EMA factor applied before taking the sign in the
                 sign-based section. Set ``0.0`` to recover plain signSGD.
             sign_state_dtype: Optional floating dtype used for the sign-section
-                momentum buffer. Leave unset to match each parameter dtype.
-                Useful for reducing optimizer-state VRAM, for example with
+                momentum buffer. The default ``"auto"`` keeps low-precision
+                parameters on ``float32`` momentum state for stability and
+                otherwise matches the parameter dtype. Use ``None`` or
+                ``"parameter"`` to always match the parameter dtype. Useful for
+                reducing optimizer-state VRAM, for example with
                 ``torch.bfloat16`` on CUDA.
             betas: AdamW first- and second-moment coefficients for the AdamW
                 section.
@@ -247,10 +266,16 @@ class STAC(Optimizer):
             error_if_nonfinite: Raise ``RuntimeError`` when a gradient contains
                 ``NaN`` or ``Inf`` values. If ``False``, STAC skips the entire
                 step instead.
+            foreach: If ``True``, STAC opts into PyTorch's multi-tensor
+                ``foreach`` step path when the current parameter group is
+                compatible. This is often faster on CUDA, but it uses extra
+                temporary memory. The default ``False`` keeps STAC more VRAM
+                conservative.
         """
         self._validate_nonnegative("lr", lr)
         self._validate_nonnegative("eps", eps)
         self._validate_nonnegative("weight_decay", weight_decay)
+        self._validate_positive("sign_lr_scale", sign_lr_scale)
         beta1, beta2 = betas
         if not 0.0 <= beta1 < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {beta1}.")
@@ -269,7 +294,7 @@ class STAC(Optimizer):
             last_n_modules=last_n_modules,
         )
         default_sign_lr = (
-            lr * _HYBRID_SIGN_LR_SCALE
+            lr * sign_lr_scale
             if partition.sign_modules and partition.adamw_modules
             else lr
         )
@@ -285,6 +310,7 @@ class STAC(Optimizer):
 
         self.partition = partition
         self.last_n_modules = last_n_modules
+        self.sign_lr_scale = sign_lr_scale
         self.nonfinite_skipped_steps = 0
 
         param_groups: list[dict[str, object]] = []
@@ -297,8 +323,10 @@ class STAC(Optimizer):
                     "param_names": self.partition.sign_parameter_names,
                     "lr": default_sign_lr,
                     "weight_decay": sign_weight_decay,
+                    "sign_lr_scale": sign_lr_scale,
                     "sign_momentum": sign_momentum,
                     "sign_state_dtype": resolved_sign_state_dtype,
+                    "foreach": foreach,
                 }
             )
         if self.partition.adamw_modules:
@@ -310,11 +338,13 @@ class STAC(Optimizer):
                     "param_names": self.partition.adamw_parameter_names,
                     "lr": lr,
                     "weight_decay": adamw_weight_decay,
+                    "foreach": foreach,
                 }
             )
 
         defaults = {
             "lr": lr,
+            "sign_lr_scale": sign_lr_scale,
             "sign_momentum": sign_momentum,
             "sign_state_dtype": resolved_sign_state_dtype,
             "betas": betas,
@@ -325,6 +355,7 @@ class STAC(Optimizer):
             "amsgrad": amsgrad,
             "maximize": maximize,
             "error_if_nonfinite": error_if_nonfinite,
+            "foreach": foreach,
         }
         self._initializing = True
         try:
@@ -338,19 +369,27 @@ class STAC(Optimizer):
             raise ValueError(f"Invalid {name}: {value}.")
 
     @staticmethod
+    def _validate_positive(name: str, value: float) -> None:
+        if value <= 0.0:
+            raise ValueError(f"Invalid {name}: {value}.")
+
+    @staticmethod
     def _resolve_sign_state_dtype(
         value: torch.dtype | str | None,
-    ) -> torch.dtype | None:
+    ) -> torch.dtype | str | None:
         if value is None:
             return None
         if isinstance(value, str):
             normalized_value = value.strip().lower()
+            if normalized_value == _AUTO_SIGN_STATE_DTYPE:
+                return _AUTO_SIGN_STATE_DTYPE
             if normalized_value in {"parameter", "match_parameter"}:
                 return None
             resolved_value = _SIGN_STATE_DTYPE_ALIASES.get(normalized_value)
             if resolved_value is None:
                 raise ValueError(
                     "sign_state_dtype must be a floating torch.dtype, None, "
+                    'or one of: auto, match_parameter, parameter, '
                     "or one of: "
                     f"{', '.join(sorted(_SIGN_STATE_DTYPE_ALIASES))}."
                 )
@@ -366,6 +405,19 @@ class STAC(Optimizer):
                 "sign_state_dtype must be a floating-point dtype."
             )
         return value
+
+    @staticmethod
+    def _get_sign_state_dtype(
+        parameter: nn.Parameter,
+        sign_state_dtype: torch.dtype | str | None,
+    ) -> torch.dtype:
+        if sign_state_dtype == _AUTO_SIGN_STATE_DTYPE:
+            if parameter.dtype in {torch.float16, torch.bfloat16}:
+                return torch.float32
+            return parameter.dtype
+        if sign_state_dtype is None:
+            return parameter.dtype
+        return sign_state_dtype
 
     def add_param_group(self, param_group: dict[str, object]) -> None:
         if getattr(self, "_initializing", False):
@@ -386,12 +438,14 @@ class STAC(Optimizer):
             group.setdefault("stac_role", "sign")
             group.setdefault("module_names", ())
             group.setdefault("param_names", ())
+            group.setdefault("sign_lr_scale", _DEFAULT_SIGN_LR_SCALE)
             group.setdefault("sign_momentum", 0.0)
             group.setdefault("sign_state_dtype", None)
             group.setdefault("betas", (0.9, 0.999))
             group.setdefault("eps", 1e-8)
             group.setdefault("amsgrad", False)
             group.setdefault("error_if_nonfinite", False)
+            group.setdefault("foreach", False)
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Load optimizer state while preserving the current STAC partition.
@@ -406,7 +460,11 @@ class STAC(Optimizer):
         super().load_state_dict(state_dict)
 
     @torch.no_grad()
-    def step(self, closure: Callable[[], torch.Tensor] | None = None):
+    def step(
+        self,
+        closure: Callable[[], torch.Tensor] | None = None,
+    ) -> torch.Tensor | None:
+        """Perform a single optimization step."""
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -451,10 +509,9 @@ class STAC(Optimizer):
             if sign_momentum != 0.0:
                 state = self.state[parameter]
                 momentum_buffer = state.get("sign_momentum_buffer")
-                buffer_dtype = (
-                    parameter.dtype
-                    if sign_state_dtype is None
-                    else sign_state_dtype
+                buffer_dtype = self._get_sign_state_dtype(
+                    parameter,
+                    sign_state_dtype,
                 )
                 if momentum_buffer is None:
                     momentum_buffer = state["sign_momentum_buffer"] = torch.zeros_like(
@@ -467,7 +524,11 @@ class STAC(Optimizer):
         if not parameters:
             return
 
-        if self._can_use_foreach(parameters, updates):
+        use_foreach = bool(group["foreach"]) and self._can_use_foreach(
+            parameters,
+            updates,
+        )
+        if use_foreach:
             if weight_decay != 0:
                 torch._foreach_mul_(parameters, 1 - lr * weight_decay)
 
@@ -582,6 +643,10 @@ class STAC(Optimizer):
         if not parameters:
             return
 
+        use_foreach = bool(group["foreach"]) and self._can_use_foreach(
+            parameters,
+            gradients,
+        )
         adamw_functional(
             params=parameters,
             grads=gradients,
@@ -589,7 +654,7 @@ class STAC(Optimizer):
             exp_avg_sqs=exp_avg_sqs,
             max_exp_avg_sqs=max_exp_avg_sqs,
             state_steps=state_steps,
-            foreach=None,
+            foreach=use_foreach,
             capturable=False,
             differentiable=False,
             fused=None,

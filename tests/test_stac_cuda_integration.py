@@ -84,6 +84,40 @@ class ClassificationStudent(nn.Module):
         return self.network(inputs)
 
 
+class LayerNormClassificationTeacher(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(32, 64),
+            nn.Tanh(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 5),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
+
+
+class LayerNormClassificationStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(32, 96),
+            nn.GELU(),
+            nn.LayerNorm(96),
+            nn.Linear(96, 64),
+            nn.GELU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 5),
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.network(inputs)
+
+
 class StateMemoryNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -163,6 +197,36 @@ def _make_classification_data(
     )
 
 
+@torch.no_grad()
+def _make_layernorm_classification_data(
+    seed: int,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    train_inputs = torch.randn(4096, 32, generator=generator)
+    val_inputs = torch.randn(512, 32, generator=generator)
+    teacher = LayerNormClassificationTeacher()
+    train_targets = teacher(train_inputs).argmax(dim=1)
+    val_targets = teacher(val_inputs).argmax(dim=1)
+
+    label_noise = torch.rand(4096, generator=generator) < 0.10
+    noisy_labels = torch.randint(
+        0,
+        5,
+        size=(int(label_noise.sum().item()),),
+        generator=generator,
+    )
+    train_targets[label_noise] = noisy_labels
+
+    return (
+        train_inputs.to(device),
+        train_targets.to(device),
+        val_inputs.to(device),
+        val_targets.to(device),
+    )
+
+
 def _batch_indices(
     num_samples: int,
     *,
@@ -181,13 +245,14 @@ def _make_optimizer(
     optimizer_kind: str,
     model: nn.Module,
     *,
+    last_n_modules: int = 1,
     sign_state_dtype: torch.dtype | None = None,
 ) -> torch.optim.Optimizer:
     if optimizer_kind == "stac":
         return STAC(
             model,
             lr=2e-3,
-            last_n_modules=1,
+            last_n_modules=last_n_modules,
             sign_momentum=0.9,
             sign_state_dtype=sign_state_dtype,
             weight_decay=1e-2,
@@ -220,7 +285,7 @@ def _run_regression_trial(
         seed=1000 + seed,
     )
 
-    _seed_all(100)
+    _seed_all(30_000 + seed)
     model = RegressionStudent().to(device)
     optimizer = _make_optimizer(
         optimizer_kind,
@@ -260,11 +325,53 @@ def _run_classification_trial(
         seed=2000 + seed,
     )
 
-    _seed_all(100)
+    _seed_all(40_000 + seed)
     model = ClassificationStudent().to(device)
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
+        sign_state_dtype=sign_state_dtype,
+    )
+
+    for batch_index in batch_schedule:
+        index = batch_index.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(train_inputs[index])
+        loss = torch.nn.functional.cross_entropy(logits, train_targets[index])
+        loss.backward()
+        optimizer.step()
+
+    with torch.no_grad():
+        logits = model(val_inputs)
+        loss = float(torch.nn.functional.cross_entropy(logits, val_targets).cpu())
+        accuracy = float((logits.argmax(dim=1) == val_targets).float().mean().cpu())
+        return loss, accuracy
+
+
+def _run_layernorm_classification_trial(
+    seed: int,
+    optimizer_kind: str,
+    *,
+    device: torch.device,
+    last_n_modules: int = 1,
+    sign_state_dtype: torch.dtype | None = None,
+) -> tuple[float, float]:
+    train_inputs, train_targets, val_inputs, val_targets = (
+        _make_layernorm_classification_data(seed, device=device)
+    )
+    batch_schedule = _batch_indices(
+        train_inputs.shape[0],
+        batch_size=256,
+        steps=260,
+        seed=3000 + seed,
+    )
+
+    _seed_all(50_000 + seed)
+    model = LayerNormClassificationStudent().to(device)
+    optimizer = _make_optimizer(
+        optimizer_kind,
+        model,
+        last_n_modules=last_n_modules,
         sign_state_dtype=sign_state_dtype,
     )
 
@@ -298,17 +405,43 @@ def test_stac_is_competitive_with_adamw_on_noisy_cuda_suite(
     regression_results = {
         optimizer_kind: [
             _run_regression_trial(seed, optimizer_kind, device=cuda_device)
-            for seed in range(4)
+            for seed in range(5)
         ]
         for optimizer_kind in ("stac", "adamw")
     }
     classification_results = {
         optimizer_kind: [
             _run_classification_trial(seed, optimizer_kind, device=cuda_device)
-            for seed in range(4)
+            for seed in range(5)
         ]
         for optimizer_kind in ("stac", "adamw")
     }
+    layernorm_default_results = [
+        _run_layernorm_classification_trial(
+            seed,
+            "stac",
+            device=cuda_device,
+            last_n_modules=1,
+        )
+        for seed in range(3)
+    ]
+    layernorm_wide_results = [
+        _run_layernorm_classification_trial(
+            seed,
+            "stac",
+            device=cuda_device,
+            last_n_modules=2,
+        )
+        for seed in range(3)
+    ]
+    layernorm_adamw_results = [
+        _run_layernorm_classification_trial(
+            seed,
+            "adamw",
+            device=cuda_device,
+        )
+        for seed in range(3)
+    ]
 
     stac_regression = statistics.fmean(regression_results["stac"])
     adamw_regression = statistics.fmean(regression_results["adamw"])
@@ -324,10 +457,32 @@ def test_stac_is_competitive_with_adamw_on_noisy_cuda_suite(
     adamw_classification_acc = statistics.fmean(
         accuracy for _, accuracy in classification_results["adamw"]
     )
+    stac_layernorm_default_loss = statistics.fmean(
+        loss for loss, _ in layernorm_default_results
+    )
+    stac_layernorm_wide_loss = statistics.fmean(
+        loss for loss, _ in layernorm_wide_results
+    )
+    adamw_layernorm_loss = statistics.fmean(
+        loss for loss, _ in layernorm_adamw_results
+    )
+    stac_layernorm_default_acc = statistics.fmean(
+        accuracy for _, accuracy in layernorm_default_results
+    )
+    stac_layernorm_wide_acc = statistics.fmean(
+        accuracy for _, accuracy in layernorm_wide_results
+    )
+    adamw_layernorm_acc = statistics.fmean(
+        accuracy for _, accuracy in layernorm_adamw_results
+    )
 
     assert stac_regression <= adamw_regression * 1.10
     assert stac_classification_loss <= adamw_classification_loss * 1.08
     assert stac_classification_acc >= adamw_classification_acc - 0.02
+    assert stac_layernorm_wide_loss <= stac_layernorm_default_loss
+    assert stac_layernorm_wide_acc >= stac_layernorm_default_acc - 0.01
+    assert stac_layernorm_wide_loss <= adamw_layernorm_loss * 1.10
+    assert stac_layernorm_wide_acc >= adamw_layernorm_acc - 0.03
 
 
 def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
