@@ -5,10 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stac-optimizer"
 dynamic = ["version"]
-description = "STAC optimizer with sign-based early-layer updates and AdamW on the last N trainable layers."
-readme = "README.md"
+description = "STAC optimizer with a state-free sign trunk and AdamW on the final trainable-module tail."
+readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.13"
 dependencies = ["torch>=2.10"]
+authors = [{name = "smturtle2"}]
+maintainers = [{name = "smturtle2"}]
 keywords = ["pytorch", "optimizer", "signsgd", "adamw"]
 classifiers = [
   "Development Status :: 4 - Beta",
@@ -24,7 +26,8 @@ Repository = "https://github.com/smturtle2/stac-optimizer"
 Issues = "https://github.com/smturtle2/stac-optimizer/issues"
 "Documentation" = "https://github.com/smturtle2/stac-optimizer/blob/main/docs/en/optimizer.md"
 "Documentation (Korean)" = "https://github.com/smturtle2/stac-optimizer/blob/main/docs/ko/optimizer.md"
-"Benchmark Report" = "https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json"
+"Benchmark JSON" = "https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json"
+"Benchmark Plot" = "https://raw.githubusercontent.com/smturtle2/stac-optimizer/main/docs/benchmark/research_benchmark.png"
 "README (Korean)" = "https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md"
 
 [project.optional-dependencies]

@@ -29,7 +29,8 @@ class BenchmarkConfig:
     label: str
     optimizer_kind: str
     lr: float = 2e-3
-    last_n_modules: int = 1
+    last_n_modules: int | None = None
+    last_n_ratio: float = 0.125
     sign_lr_scale: float = 1.0
     weight_decay: float = 1e-2
     sign_weight_decay: float | None = None
@@ -195,6 +196,12 @@ def seed_all(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def build_seeded_teacher(factory: type[nn.Module], seed: int) -> nn.Module:
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        return factory()
+
+
 @torch.no_grad()
 def make_regression_data(
     seed: int,
@@ -205,7 +212,7 @@ def make_regression_data(
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(task.train_samples, task.input_dim, generator=generator)
     val_inputs = torch.randn(task.val_samples, task.input_dim, generator=generator)
-    teacher = DeepRegressionTeacher()
+    teacher = build_seeded_teacher(DeepRegressionTeacher, 10_000 + seed)
     train_targets = teacher(train_inputs) + 0.10 * torch.randn(
         task.train_samples,
         6,
@@ -235,7 +242,9 @@ def make_classification_data(
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(task.train_samples, task.input_dim, generator=generator)
     val_inputs = torch.randn(task.val_samples, task.input_dim, generator=generator)
-    teacher = TailNormTeacher() if tail_norm else DeepClassificationTeacher()
+    teacher_factory = TailNormTeacher if tail_norm else DeepClassificationTeacher
+    teacher_seed_offset = 20_000 if tail_norm else 15_000
+    teacher = build_seeded_teacher(teacher_factory, teacher_seed_offset + seed)
     train_targets = teacher(train_inputs).argmax(dim=1)
     val_targets = teacher(val_inputs).argmax(dim=1)
 
@@ -278,6 +287,7 @@ def build_optimizer(
         return STAC(
             model,
             lr=config.lr,
+            last_n_ratio=config.last_n_ratio,
             last_n_modules=config.last_n_modules,
             sign_lr_scale=config.sign_lr_scale,
             weight_decay=config.weight_decay,
@@ -752,17 +762,16 @@ def main() -> None:
             linestyle="-",
         ),
         BenchmarkConfig(
-            label="STAC balanced trunk",
+            label="STAC full-decay trunk",
             optimizer_kind="stac",
-            sign_weight_decay=5e-3,
+            sign_weight_decay=1e-2,
             color="#b45309",
             linestyle=(0, (6, 2)),
         ),
         BenchmarkConfig(
             label="STAC wider cap",
             optimizer_kind="stac",
-            last_n_modules=4,
-            sign_weight_decay=5e-3,
+            last_n_ratio=0.25,
             color="#c2410c",
             linestyle="-.",
         ),
@@ -814,7 +823,10 @@ def main() -> None:
             "steps_per_epoch": args.steps_per_epoch,
             "batch_size": args.batch_size,
             "memory_batch_size": args.memory_batch_size,
-            "model_init_seed_policy": "per-trial seed matched across optimizers",
+            "model_init_seed_policy": (
+                "paired trials with seeded teachers, seeded student "
+                "initialization, and fixed batch schedules per seed"
+            ),
             "memory_measurement_scope": "optimizer.step() on the first state-allocating update",
             "task_names": list(task_names),
             "plot_path": str(plot_path),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import torch
@@ -10,6 +11,7 @@ from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
 _DEFAULT_SIGN_LR_SCALE = 1.0
+_DEFAULT_ADAMW_RATIO = 0.18
 _LEGACY_SIGN_STATE_KEYS = frozenset({"sign_momentum_buffer"})
 
 
@@ -40,6 +42,16 @@ class STACPartition:
 
     sign_modules: tuple[ModuleGroup, ...]
     adamw_modules: tuple[ModuleGroup, ...]
+
+    @property
+    def trainable_module_count(self) -> int:
+        """Total number of counted trainable modules in the partition."""
+        return len(self.sign_modules) + len(self.adamw_modules)
+
+    @property
+    def resolved_last_n_modules(self) -> int:
+        """Number of counted trainable modules assigned to the AdamW section."""
+        return len(self.adamw_modules)
 
     @property
     def sign_module_names(self) -> tuple[str, ...]:
@@ -97,34 +109,103 @@ class _PreparedGroup:
     gradients: tuple[torch.Tensor, ...]
 
 
+def _resolve_ratio_alias(
+    *,
+    last_n_ratio: float | None,
+    adamw_ratio: float | None,
+) -> float:
+    if last_n_ratio is not None and adamw_ratio is not None:
+        if not math.isclose(last_n_ratio, adamw_ratio):
+            raise ValueError(
+                "last_n_ratio and adamw_ratio must match when both are provided."
+            )
+        return last_n_ratio
+    if last_n_ratio is not None:
+        return last_n_ratio
+    if adamw_ratio is not None:
+        return adamw_ratio
+    return _DEFAULT_ADAMW_RATIO
+
+
+def resolve_adamw_cap_module_count(
+    total_trainable_modules: int,
+    *,
+    last_n_modules: int | None = None,
+    last_n_ratio: float | None = None,
+    adamw_ratio: float | None = None,
+) -> int:
+    """Resolve how many final trainable modules should use AdamW.
+
+    Args:
+        total_trainable_modules: Number of counted trainable modules.
+        last_n_modules: Optional explicit number of final trainable modules to
+            place in the AdamW cap.
+        last_n_ratio: Preferred public alias for the AdamW tail ratio.
+        adamw_ratio: Backward-compatible alias for ``last_n_ratio``.
+
+    Returns:
+        The resolved AdamW-cap size clamped to the available trainable module
+        count.
+
+    Raises:
+        ValueError: If the ratio is invalid, the explicit count is negative, or
+            the ratio aliases disagree.
+    """
+    if total_trainable_modules < 0:
+        raise ValueError(
+            "total_trainable_modules must be greater than or equal to 0."
+        )
+
+    resolved_ratio = _resolve_ratio_alias(
+        last_n_ratio=last_n_ratio,
+        adamw_ratio=adamw_ratio,
+    )
+    return _resolve_adamw_module_count(
+        last_n_modules=last_n_modules,
+        adamw_ratio=resolved_ratio,
+        trainable_module_count=total_trainable_modules,
+    )
+
+
 def partition_trainable_modules(
     model: nn.Module,
     *,
-    last_n_modules: int = 1,
+    last_n_ratio: float | None = None,
+    adamw_ratio: float | None = None,
+    last_n_modules: int | None = None,
 ) -> STACPartition:
     """Split a model into sign and AdamW sections by trainable module order.
 
     STAC walks ``model.named_modules()`` in registration order and treats each
     module that owns trainable parameters directly as one counted module. The
-    final ``last_n_modules`` counted modules become the AdamW section;
-    everything before that
-    stays in the sign-based section.
+    final portion of that ordered list becomes the AdamW section and everything
+    before it stays in the sign-based section.
 
     Args:
         model: Module whose trainable parameters should be partitioned.
-        last_n_modules: Number of final trainable modules that should use AdamW.
+        last_n_ratio: Preferred public alias for the AdamW tail ratio.
+        adamw_ratio: Backward-compatible alias for ``last_n_ratio``. When both
+            ratio arguments are omitted, STAC defaults to ``0.18``.
+        last_n_modules: Optional explicit number of final trainable modules that
+            should use AdamW. When provided, it overrides ratio mode.
 
     Returns:
         A deterministic partition describing which modules belong to the sign
         section and which belong to the AdamW section.
 
     Raises:
-        ValueError: If ``last_n_modules`` is negative or the model has no
-            trainable parameters.
+        ValueError: If the ratio arguments are invalid, the explicit count is
+            negative, or the model has no trainable parameters.
     """
-
-    if last_n_modules < 0:
-        raise ValueError("last_n_modules must be greater than or equal to 0.")
+    resolved_ratio = _resolve_ratio_alias(
+        last_n_ratio=last_n_ratio,
+        adamw_ratio=adamw_ratio,
+    )
+    _resolve_adamw_module_count(
+        last_n_modules=last_n_modules,
+        adamw_ratio=resolved_ratio,
+        trainable_module_count=None,
+    )
 
     seen_parameters: set[int] = set()
     module_groups: list[ModuleGroup] = []
@@ -158,23 +239,58 @@ def partition_trainable_modules(
     if not module_groups:
         raise ValueError("STAC requires at least one trainable parameter.")
 
-    sign_count = max(len(module_groups) - last_n_modules, 0)
+    resolved_last_n_modules = _resolve_adamw_module_count(
+        last_n_modules=last_n_modules,
+        adamw_ratio=resolved_ratio,
+        trainable_module_count=len(module_groups),
+    )
+    sign_count = max(len(module_groups) - resolved_last_n_modules, 0)
     return STACPartition(
         sign_modules=tuple(module_groups[:sign_count]),
         adamw_modules=tuple(module_groups[sign_count:]),
     )
 
 
+def _resolve_adamw_module_count(
+    *,
+    last_n_modules: int | None,
+    adamw_ratio: float,
+    trainable_module_count: int | None,
+) -> int:
+    if not 0.0 <= adamw_ratio <= 1.0:
+        raise ValueError(f"adamw_ratio must be between 0.0 and 1.0, got {adamw_ratio}.")
+
+    if last_n_modules is not None:
+        if last_n_modules < 0:
+            raise ValueError("last_n_modules must be greater than or equal to 0.")
+        if trainable_module_count is None:
+            return last_n_modules
+        return min(last_n_modules, trainable_module_count)
+
+    if trainable_module_count is None:
+        return 0
+    if adamw_ratio == 0.0:
+        return 0
+
+    return min(
+        max(math.ceil(trainable_module_count * adamw_ratio), 1),
+        trainable_module_count,
+    )
+
+
 class STAC(Optimizer):
-    r"""SignSGD section with an AdamW section over the last N trainable modules.
+    r"""SignSGD section with an AdamW section over the last trainable-module tail.
 
     Module discovery is deterministic: STAC walks ``model.named_modules()`` in
     registration order and treats each module that owns trainable parameters
-    directly (``recurse=False``) as one counted module. The final
-    ``last_n_modules`` of that ordered list use AdamW, while all earlier
-    modules use textbook signSGD with decoupled weight decay. The sign-based
-    section is intentionally stateless: it keeps no momentum, EMA, or other
-    sign-side optimizer tensors.
+    directly (``recurse=False``) as one counted module. By default the final
+    18 percent of that ordered list use AdamW, while all earlier modules use
+    textbook signSGD with decoupled weight decay. Pass ``last_n_modules`` to
+    override the ratio with an explicit module count. ``last_n_ratio`` is the
+    preferred public name for that ratio, while ``adamw_ratio`` remains a
+    backward-compatible alias. The sign-based section is intentionally
+    stateless: it keeps no momentum, EMA, or other sign-side optimizer
+    tensors.
 
     Pure containers such as ``nn.Sequential`` are skipped unless they own
     trainable parameters themselves. In practice this means the counted modules
@@ -188,10 +304,11 @@ class STAC(Optimizer):
     when a workload needs it.
 
     When decoupled weight decay is enabled in hybrid mode, the sign trunk often
-    benefits from a lighter decay than the AdamW cap. The repository CUDA
-    benchmark found ``sign_weight_decay=0.5 * weight_decay`` to be a strong
-    starting point on deep classification-style workloads without adding any
-    sign-side optimizer state.
+    benefits from a lighter decay than the AdamW cap. STAC therefore defaults
+    the sign trunk to ``0.5 * weight_decay`` in hybrid mode unless
+    ``sign_weight_decay`` is set explicitly. The repository CUDA benchmark
+    found that to be a strong starting point on deep classification-style
+    workloads without adding any sign-side optimizer state.
 
     By default STAC uses single-tensor step logic instead of PyTorch's
     ``foreach`` optimizer path. This keeps peak CUDA memory more conservative.
@@ -206,6 +323,11 @@ class STAC(Optimizer):
 
     Attributes:
         partition: Deterministic sign/AdamW split derived from model structure.
+        last_n_ratio: Preferred public ratio value used when
+            ``last_n_modules`` is omitted.
+        adamw_ratio: Fractional tail used when ``last_n_modules`` is omitted.
+        resolved_last_n_modules: Actual number of counted trainable modules
+            assigned to the AdamW section for the current model.
         nonfinite_skipped_steps: Number of skipped :meth:`step` calls caused by
             non-finite dense gradients while ``error_if_nonfinite=False``.
     """
@@ -215,7 +337,9 @@ class STAC(Optimizer):
         model: nn.Module,
         *,
         lr: float = 1e-3,
-        last_n_modules: int = 1,
+        last_n_modules: int | None = None,
+        last_n_ratio: float | None = None,
+        adamw_ratio: float | None = None,
         sign_lr_scale: float = _DEFAULT_SIGN_LR_SCALE,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
@@ -234,8 +358,12 @@ class STAC(Optimizer):
             lr: Shared base learning rate. In hybrid mode, STAC internally uses
                 ``sign_lr_scale * lr`` for the sign-based section and ``lr``
                 for the AdamW section.
-            last_n_modules: Number of final trainable modules that should use
-                AdamW. Earlier trainable modules use the sign-based section.
+            last_n_modules: Optional explicit number of final trainable modules
+                that should use AdamW. When provided, it overrides
+                ratio mode.
+            last_n_ratio: Preferred public alias for the AdamW tail ratio.
+            adamw_ratio: Backward-compatible alias for ``last_n_ratio``. When
+                both ratio arguments are omitted, STAC defaults to ``0.18``.
             sign_lr_scale: Multiplicative factor applied to ``lr`` for the
                 sign-based section when both sections are active. The default
                 ``1.0`` matches the shared learning rate. Lower this value when
@@ -247,8 +375,9 @@ class STAC(Optimizer):
             weight_decay: Shared decoupled weight decay applied to both roles
                 unless overridden.
             sign_weight_decay: Decoupled weight decay for the sign-based section.
-                In hybrid mode, ``0.5 * weight_decay`` is often a better
-                stability starting point than matching the AdamW cap exactly.
+                In hybrid mode, ``None`` defaults to ``0.5 * weight_decay`` as
+                a benchmark-backed stability starting point. Outside hybrid
+                mode, ``None`` inherits ``weight_decay``.
             adamw_weight_decay: Decoupled weight decay for the AdamW section.
             amsgrad: Enable the AMSGrad variant for the AdamW section.
             maximize: Maximize the objective instead of minimizing it.
@@ -265,6 +394,15 @@ class STAC(Optimizer):
         self._validate_nonnegative("eps", eps)
         self._validate_nonnegative("weight_decay", weight_decay)
         self._validate_positive("sign_lr_scale", sign_lr_scale)
+        resolved_ratio = _resolve_ratio_alias(
+            last_n_ratio=last_n_ratio,
+            adamw_ratio=adamw_ratio,
+        )
+        _resolve_adamw_module_count(
+            last_n_modules=last_n_modules,
+            adamw_ratio=resolved_ratio,
+            trainable_module_count=None,
+        )
         beta1, beta2 = betas
         if not 0.0 <= beta1 < 1.0:
             raise ValueError(f"Invalid beta parameter at index 0: {beta1}.")
@@ -273,6 +411,7 @@ class STAC(Optimizer):
 
         partition = partition_trainable_modules(
             model,
+            last_n_ratio=resolved_ratio,
             last_n_modules=last_n_modules,
         )
         default_sign_lr = (
@@ -281,7 +420,11 @@ class STAC(Optimizer):
             else lr
         )
         sign_weight_decay = (
-            weight_decay if sign_weight_decay is None else sign_weight_decay
+            (0.5 * weight_decay)
+            if sign_weight_decay is None
+            and partition.sign_modules
+            and partition.adamw_modules
+            else weight_decay if sign_weight_decay is None else sign_weight_decay
         )
         adamw_weight_decay = (
             weight_decay if adamw_weight_decay is None else adamw_weight_decay
@@ -291,7 +434,11 @@ class STAC(Optimizer):
         self._validate_nonnegative("adamw_weight_decay", adamw_weight_decay)
 
         self.partition = partition
-        self.last_n_modules = last_n_modules
+        self.requested_last_n_modules = last_n_modules
+        self.last_n_modules = partition.resolved_last_n_modules
+        self.last_n_ratio = resolved_ratio
+        self.adamw_ratio = resolved_ratio
+        self.resolved_last_n_modules = partition.resolved_last_n_modules
         self.sign_lr_scale = sign_lr_scale
         self.nonfinite_skipped_steps = 0
 
@@ -305,6 +452,9 @@ class STAC(Optimizer):
                     "param_names": self.partition.sign_parameter_names,
                     "lr": default_sign_lr,
                     "weight_decay": sign_weight_decay,
+                    "last_n_ratio": resolved_ratio,
+                    "adamw_ratio": resolved_ratio,
+                    "resolved_last_n_modules": partition.resolved_last_n_modules,
                     "sign_lr_scale": sign_lr_scale,
                     "foreach": foreach,
                 }
@@ -318,12 +468,17 @@ class STAC(Optimizer):
                     "param_names": self.partition.adamw_parameter_names,
                     "lr": lr,
                     "weight_decay": adamw_weight_decay,
+                    "last_n_ratio": resolved_ratio,
+                    "adamw_ratio": resolved_ratio,
+                    "resolved_last_n_modules": partition.resolved_last_n_modules,
                     "foreach": foreach,
                 }
             )
 
         defaults = {
             "lr": lr,
+            "last_n_ratio": resolved_ratio,
+            "adamw_ratio": resolved_ratio,
             "sign_lr_scale": sign_lr_scale,
             "betas": betas,
             "eps": eps,
@@ -370,12 +525,33 @@ class STAC(Optimizer):
             group.setdefault("stac_role", "sign")
             group.setdefault("module_names", ())
             group.setdefault("param_names", ())
+            group.setdefault("last_n_ratio", _DEFAULT_ADAMW_RATIO)
+            group.setdefault("adamw_ratio", _DEFAULT_ADAMW_RATIO)
+            group.setdefault("resolved_last_n_modules", 0)
             group.setdefault("sign_lr_scale", _DEFAULT_SIGN_LR_SCALE)
             group.setdefault("betas", (0.9, 0.999))
             group.setdefault("eps", 1e-8)
             group.setdefault("amsgrad", False)
             group.setdefault("error_if_nonfinite", False)
             group.setdefault("foreach", False)
+        adamw_module_names = next(
+            (
+                tuple(group.get("module_names", ()))
+                for group in self.param_groups
+                if group["stac_role"] == "adamw"
+            ),
+            (),
+        )
+        if not hasattr(self, "requested_last_n_modules"):
+            self.requested_last_n_modules = None
+        if not hasattr(self, "last_n_ratio"):
+            self.last_n_ratio = float(self.param_groups[0]["last_n_ratio"])
+        if not hasattr(self, "adamw_ratio"):
+            self.adamw_ratio = float(self.param_groups[0]["adamw_ratio"])
+        if not hasattr(self, "resolved_last_n_modules"):
+            self.resolved_last_n_modules = len(adamw_module_names)
+        if not hasattr(self, "last_n_modules"):
+            self.last_n_modules = self.resolved_last_n_modules
         self._drop_legacy_sign_state()
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
@@ -506,16 +682,6 @@ class STAC(Optimizer):
                 torch._foreach_mul_(parameters, 1 - lr * weight_decay)
 
             directions = torch._foreach_sign(list(gradients))
-            directions = [
-                direction.to(dtype=parameter.dtype)
-                if direction.dtype != parameter.dtype
-                else direction
-                for direction, parameter in zip(
-                    directions,
-                    parameters,
-                    strict=True,
-                )
-            ]
             torch._foreach_add_(parameters, directions, alpha=-lr)
             return
 

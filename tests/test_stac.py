@@ -6,7 +6,11 @@ import pytest
 import torch
 from torch import nn
 
-from stac_optimizer import STAC, partition_trainable_modules
+from stac_optimizer import (
+    STAC,
+    partition_trainable_modules,
+    resolve_adamw_cap_module_count,
+)
 
 
 class StackedNet(nn.Module):
@@ -70,6 +74,14 @@ class ShapeShiftNet(nn.Module):
         self.head = nn.Linear(1, 2, bias=False)
 
 
+class NineLayerNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [nn.Linear(2, 2, bias=False) for _ in range(9)]
+        )
+
+
 @pytest.fixture(scope="module")
 def cuda_device() -> torch.device:
     if not torch.cuda.is_available():
@@ -84,6 +96,41 @@ def test_partition_defaults_to_last_trainable_module() -> None:
 
     assert partition.sign_module_names == ("stem", "block.0", "block.2")
     assert partition.adamw_module_names == ("head",)
+
+
+def test_default_ratio_uses_ceiling_over_last_module_tail() -> None:
+    model = NineLayerNet()
+
+    partition = partition_trainable_modules(model)
+
+    assert partition.trainable_module_count == 9
+    assert partition.resolved_last_n_modules == 2
+    assert partition.sign_module_names == tuple(
+        f"layers.{index}" for index in range(7)
+    )
+    assert partition.adamw_module_names == ("layers.7", "layers.8")
+
+
+def test_last_n_ratio_alias_matches_adamw_ratio() -> None:
+    model = NineLayerNet()
+
+    partition = partition_trainable_modules(model, last_n_ratio=0.125)
+
+    assert partition.resolved_last_n_modules == 2
+    assert partition.adamw_module_names == ("layers.7", "layers.8")
+
+
+def test_explicit_last_n_modules_overrides_ratio() -> None:
+    model = NineLayerNet()
+
+    partition = partition_trainable_modules(
+        model,
+        last_n_ratio=0.75,
+        last_n_modules=1,
+    )
+
+    assert partition.resolved_last_n_modules == 1
+    assert partition.adamw_module_names == ("layers.8",)
 
 
 def test_partition_skips_frozen_modules_when_counting_last_n() -> None:
@@ -176,6 +223,20 @@ def test_negative_last_n_modules_is_rejected() -> None:
         STAC(model, last_n_modules=-1)
 
 
+def test_invalid_adamw_ratio_is_rejected() -> None:
+    model = StackedNet()
+
+    with pytest.raises(ValueError, match="adamw_ratio"):
+        STAC(model, adamw_ratio=1.1)
+
+
+def test_conflicting_ratio_aliases_are_rejected() -> None:
+    model = StackedNet()
+
+    with pytest.raises(ValueError, match="last_n_ratio and adamw_ratio"):
+        STAC(model, last_n_ratio=0.125, adamw_ratio=0.25)
+
+
 def test_nonpositive_sign_lr_scale_is_rejected() -> None:
     model = StackedNet()
 
@@ -189,8 +250,25 @@ def test_last_n_modules_is_stored_on_optimizer() -> None:
     optimizer = STAC(model, last_n_modules=2)
 
     assert optimizer.last_n_modules == 2
+    assert optimizer.requested_last_n_modules == 2
     assert optimizer.partition.sign_module_names == ("stem", "block.0")
     assert optimizer.partition.adamw_module_names == ("block.2", "head")
+
+
+def test_default_ratio_is_stored_on_optimizer() -> None:
+    model = NineLayerNet()
+
+    optimizer = STAC(model)
+
+    assert optimizer.requested_last_n_modules is None
+    assert optimizer.last_n_ratio == pytest.approx(0.18)
+    assert optimizer.adamw_ratio == pytest.approx(0.18)
+    assert optimizer.last_n_modules == 2
+    assert optimizer.resolved_last_n_modules == 2
+
+
+def test_public_ratio_resolver_supports_preferred_alias() -> None:
+    assert resolve_adamw_cap_module_count(9, last_n_ratio=0.125) == 2
 
 
 def test_requires_at_least_one_trainable_parameter() -> None:
@@ -217,6 +295,7 @@ def test_sign_section_uses_plain_signsgd_while_adamw_matches_adamw(
         betas=(0.9, 0.99),
         eps=1e-8,
         weight_decay=0.01,
+        sign_weight_decay=0.01,
     )
 
     reference_parameter = nn.Parameter(torch.tensor([[1.0]], device=cuda_device))
@@ -300,6 +379,22 @@ def test_role_specific_weight_decay_is_applied(
         torch.tensor([[1.0]], device=cuda_device),
         atol=1e-6,
     )
+
+
+def test_hybrid_mode_defaults_to_lighter_sign_weight_decay() -> None:
+    model = TwoLayerNet()
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_modules=1,
+        weight_decay=0.02,
+    )
+
+    assert optimizer.param_groups[0]["stac_role"] == "sign"
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.01)
+    assert optimizer.param_groups[1]["stac_role"] == "adamw"
+    assert optimizer.param_groups[1]["weight_decay"] == pytest.approx(0.02)
 
 
 def test_state_dict_round_trip_preserves_optimizer_behavior(

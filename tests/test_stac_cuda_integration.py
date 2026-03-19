@@ -24,6 +24,12 @@ def _seed_all(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _build_seeded_teacher(factory: type[nn.Module], seed: int) -> nn.Module:
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        return factory()
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, width: int, *, use_layernorm: bool) -> None:
         super().__init__()
@@ -166,7 +172,7 @@ def _make_regression_data(
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(4096, 48, generator=generator)
     val_inputs = torch.randn(1024, 48, generator=generator)
-    teacher = DeepRegressionTeacher()
+    teacher = _build_seeded_teacher(DeepRegressionTeacher, 10_000 + seed)
     train_targets = teacher(train_inputs) + 0.10 * torch.randn(
         4096,
         6,
@@ -195,7 +201,9 @@ def _make_classification_data(
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(4096, 64, generator=generator)
     val_inputs = torch.randn(1024, 64, generator=generator)
-    teacher = TailNormTeacher() if tail_norm else DeepClassificationTeacher()
+    teacher_factory = TailNormTeacher if tail_norm else DeepClassificationTeacher
+    teacher_seed_offset = 20_000 if tail_norm else 15_000
+    teacher = _build_seeded_teacher(teacher_factory, teacher_seed_offset + seed)
     train_targets = teacher(train_inputs).argmax(dim=1)
     val_targets = teacher(val_inputs).argmax(dim=1)
 
@@ -234,7 +242,8 @@ def _make_optimizer(
     optimizer_kind: str,
     model: nn.Module,
     *,
-    last_n_modules: int = 1,
+    last_n_modules: int | None = None,
+    last_n_ratio: float = 0.18,
     sign_lr_scale: float = 1.0,
     sign_weight_decay: float | None = None,
     adamw_weight_decay: float | None = None,
@@ -243,6 +252,7 @@ def _make_optimizer(
         return STAC(
             model,
             lr=2e-3,
+            last_n_ratio=last_n_ratio,
             last_n_modules=last_n_modules,
             sign_lr_scale=sign_lr_scale,
             weight_decay=1e-2,
@@ -263,7 +273,8 @@ def _run_regression_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
-    last_n_modules: int = 1,
+    last_n_modules: int | None = None,
+    last_n_ratio: float = 0.18,
     sign_lr_scale: float = 1.0,
     sign_weight_decay: float | None = None,
     adamw_weight_decay: float | None = None,
@@ -284,6 +295,7 @@ def _run_regression_trial(
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
+        last_n_ratio=last_n_ratio,
         last_n_modules=last_n_modules,
         sign_lr_scale=sign_lr_scale,
         sign_weight_decay=sign_weight_decay,
@@ -310,7 +322,8 @@ def _run_classification_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
-    last_n_modules: int = 1,
+    last_n_modules: int | None = None,
+    last_n_ratio: float = 0.18,
     sign_lr_scale: float = 1.0,
     sign_weight_decay: float | None = None,
     adamw_weight_decay: float | None = None,
@@ -337,6 +350,7 @@ def _run_classification_trial(
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
+        last_n_ratio=last_n_ratio,
         last_n_modules=last_n_modules,
         sign_lr_scale=sign_lr_scale,
         sign_weight_decay=sign_weight_decay,
@@ -371,7 +385,8 @@ def _measure_memory(
     optimizer_kind: str,
     *,
     device: torch.device,
-    last_n_modules: int = 1,
+    last_n_modules: int | None = None,
+    last_n_ratio: float = 0.18,
     sign_lr_scale: float = 1.0,
     sign_weight_decay: float | None = None,
     adamw_weight_decay: float | None = None,
@@ -383,6 +398,7 @@ def _measure_memory(
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
+        last_n_ratio=last_n_ratio,
         last_n_modules=last_n_modules,
         sign_lr_scale=sign_lr_scale,
         sign_weight_decay=sign_weight_decay,
@@ -416,14 +432,13 @@ def test_stac_presets_form_a_quality_memory_frontier_on_deep_cuda_suite(
         "stac_default": {
             "optimizer_kind": "stac",
         },
-        "stac_balanced_trunk": {
+        "stac_12p5_tail": {
             "optimizer_kind": "stac",
-            "sign_weight_decay": 5e-3,
+            "last_n_ratio": 0.125,
         },
         "stac_wide_cap": {
             "optimizer_kind": "stac",
-            "last_n_modules": 4,
-            "sign_weight_decay": 5e-3,
+            "last_n_ratio": 0.25,
         },
         "adamw": {
             "optimizer_kind": "adamw",
@@ -463,8 +478,8 @@ def test_stac_presets_form_a_quality_memory_frontier_on_deep_cuda_suite(
     default_classification_loss = statistics.fmean(
         loss for loss, _ in classification_results["stac_default"]
     )
-    balanced_classification_loss = statistics.fmean(
-        loss for loss, _ in classification_results["stac_balanced_trunk"]
+    ratio125_classification_loss = statistics.fmean(
+        loss for loss, _ in classification_results["stac_12p5_tail"]
     )
     adamw_classification_loss = statistics.fmean(
         loss for loss, _ in classification_results["adamw"]
@@ -472,8 +487,8 @@ def test_stac_presets_form_a_quality_memory_frontier_on_deep_cuda_suite(
     default_classification_acc = statistics.fmean(
         accuracy for _, accuracy in classification_results["stac_default"]
     )
-    balanced_classification_acc = statistics.fmean(
-        accuracy for _, accuracy in classification_results["stac_balanced_trunk"]
+    ratio125_classification_acc = statistics.fmean(
+        accuracy for _, accuracy in classification_results["stac_12p5_tail"]
     )
     adamw_classification_acc = statistics.fmean(
         accuracy for _, accuracy in classification_results["adamw"]
@@ -487,8 +502,8 @@ def test_stac_presets_form_a_quality_memory_frontier_on_deep_cuda_suite(
     default_tailnorm_acc = statistics.fmean(
         accuracy for _, accuracy in tailnorm_results["stac_default"]
     )
-    wide_tailnorm_acc = statistics.fmean(
-        accuracy for _, accuracy in tailnorm_results["stac_wide_cap"]
+    ratio125_tailnorm_acc = statistics.fmean(
+        accuracy for _, accuracy in tailnorm_results["stac_12p5_tail"]
     )
 
     best_stac_regression = min(
@@ -518,9 +533,9 @@ def test_stac_presets_form_a_quality_memory_frontier_on_deep_cuda_suite(
     )
 
     assert wide_regression <= default_regression
-    assert balanced_classification_loss <= default_classification_loss
-    assert balanced_classification_acc >= default_classification_acc
-    assert wide_tailnorm_acc >= default_tailnorm_acc
+    assert default_classification_loss <= ratio125_classification_loss
+    assert default_classification_acc >= ratio125_classification_acc
+    assert default_tailnorm_acc >= ratio125_tailnorm_acc
 
     assert best_stac_regression <= adamw_regression * 1.25
     assert best_stac_classification_loss <= adamw_classification_loss * 1.08
@@ -535,7 +550,7 @@ def test_stac_presets_use_less_optimizer_state_than_adamw_on_cuda(
     _seed_all(0)
     default_model = StateMemoryNet().to(cuda_device)
     _seed_all(0)
-    balanced_model = StateMemoryNet().to(cuda_device)
+    ratio125_model = StateMemoryNet().to(cuda_device)
     _seed_all(0)
     wide_model = StateMemoryNet().to(cuda_device)
     _seed_all(0)
@@ -544,22 +559,19 @@ def test_stac_presets_use_less_optimizer_state_than_adamw_on_cuda(
     default_optimizer = STAC(
         default_model,
         lr=2e-3,
-        last_n_modules=1,
         weight_decay=1e-2,
     )
-    balanced_optimizer = STAC(
-        balanced_model,
+    ratio125_optimizer = STAC(
+        ratio125_model,
         lr=2e-3,
-        last_n_modules=1,
+        last_n_ratio=0.125,
         weight_decay=1e-2,
-        sign_weight_decay=5e-3,
     )
     wide_optimizer = STAC(
         wide_model,
         lr=2e-3,
-        last_n_modules=4,
+        last_n_ratio=0.25,
         weight_decay=1e-2,
-        sign_weight_decay=5e-3,
     )
     adamw_optimizer = torch.optim.AdamW(
         adamw_model.parameters(),
@@ -572,7 +584,7 @@ def test_stac_presets_use_less_optimizer_state_than_adamw_on_cuda(
 
     for model, optimizer in (
         (default_model, default_optimizer),
-        (balanced_model, balanced_optimizer),
+        (ratio125_model, ratio125_optimizer),
         (wide_model, wide_optimizer),
         (adamw_model, adamw_optimizer),
     ):
@@ -584,33 +596,48 @@ def test_stac_presets_use_less_optimizer_state_than_adamw_on_cuda(
         optimizer.step()
 
     default_state_bytes = _optimizer_state_bytes(default_optimizer)
-    balanced_state_bytes = _optimizer_state_bytes(balanced_optimizer)
+    ratio125_state_bytes = _optimizer_state_bytes(ratio125_optimizer)
     wide_state_bytes = _optimizer_state_bytes(wide_optimizer)
     adamw_state_bytes = _optimizer_state_bytes(adamw_optimizer)
 
-    assert default_state_bytes == balanced_state_bytes
-    assert default_state_bytes < wide_state_bytes < adamw_state_bytes
+    assert ratio125_state_bytes < default_state_bytes < wide_state_bytes
     assert wide_state_bytes < adamw_state_bytes * 0.35
+
+
+def test_research_data_generation_is_reproducible_per_seed(
+    cuda_device: torch.device,
+) -> None:
+    regression_a = _make_regression_data(123, device=cuda_device)
+    regression_b = _make_regression_data(123, device=cuda_device)
+    classification_a = _make_classification_data(123, device=cuda_device)
+    classification_b = _make_classification_data(123, device=cuda_device)
+    tailnorm_a = _make_classification_data(123, device=cuda_device, tail_norm=True)
+    tailnorm_b = _make_classification_data(123, device=cuda_device, tail_norm=True)
+
+    for first, second in (
+        (regression_a, regression_b),
+        (classification_a, classification_b),
+        (tailnorm_a, tailnorm_b),
+    ):
+        for first_tensor, second_tensor in zip(first, second, strict=True):
+            assert torch.equal(first_tensor, second_tensor)
 
 
 def test_stac_presets_use_less_peak_cuda_memory_than_adamw_on_cuda(
     cuda_device: torch.device,
 ) -> None:
     default_peak_mb, default_steady_mb = _measure_memory("stac", device=cuda_device)
-    balanced_peak_mb, balanced_steady_mb = _measure_memory(
+    ratio125_peak_mb, ratio125_steady_mb = _measure_memory(
         "stac",
         device=cuda_device,
-        sign_weight_decay=5e-3,
+        last_n_ratio=0.125,
     )
     wide_peak_mb, wide_steady_mb = _measure_memory(
         "stac",
         device=cuda_device,
-        last_n_modules=4,
-        sign_weight_decay=5e-3,
+        last_n_ratio=0.25,
     )
     adamw_peak_mb, adamw_steady_mb = _measure_memory("adamw", device=cuda_device)
 
-    assert abs(default_peak_mb - balanced_peak_mb) < 2.0
-    assert abs(default_steady_mb - balanced_steady_mb) < 2.0
-    assert default_peak_mb < wide_peak_mb < adamw_peak_mb
-    assert default_steady_mb < wide_steady_mb < adamw_steady_mb
+    assert ratio125_peak_mb < default_peak_mb < wide_peak_mb < adamw_peak_mb
+    assert ratio125_steady_mb < default_steady_mb < wide_steady_mb < adamw_steady_mb
