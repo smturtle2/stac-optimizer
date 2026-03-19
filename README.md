@@ -28,11 +28,11 @@ final trainable modules.
 
 ```mermaid
 flowchart LR
-    A[Trainable modules in registration order]
-    A --> B[Sign trunk]
-    A --> C[AdamW cap]
-    B --> D[Earlier modules<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor]
-    C --> E[Last N trainable modules<br/>standard AdamW<br/>2 state tensors]
+    A["Trainable modules in registration order"]
+    A --> B["Sign trunk"]
+    A --> C["AdamW cap"]
+    B --> D["Earlier modules<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor"]
+    C --> E["Last N trainable modules<br/>standard AdamW<br/>2 state tensors"]
 
     classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
     classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;

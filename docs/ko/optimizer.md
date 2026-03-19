@@ -12,12 +12,12 @@ momentum-stabilized sign 업데이트로, 마지막 `N`개 학습 모듈은 Adam
 
 ```mermaid
 flowchart LR
-    A[model.named_modules 순서]
-    A --> B[직접 trainable parameter를 가진 모듈만 집계]
-    B --> C[앞쪽 모듈]
-    B --> D[마지막 N개 모듈]
-    C --> E[sign trunk<br/>decoupled weight decay<br/>EMA(grad)의 sign 사용<br/>state 1개]
-    D --> F[AdamW cap<br/>decoupled weight decay<br/>1차/2차 모멘트]
+    A["model.named_modules 순서"]
+    A --> B["직접 trainable parameter를 가진 모듈만 집계"]
+    B --> C["앞쪽 모듈"]
+    B --> D["마지막 N개 모듈"]
+    C --> E["sign trunk<br/>decoupled weight decay<br/>EMA(grad)의 sign 사용<br/>state 1개"]
+    D --> F["AdamW cap<br/>decoupled weight decay<br/>1차/2차 모멘트"]
 
     classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
     classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;

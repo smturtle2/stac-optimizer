@@ -28,11 +28,11 @@ optimizer-state VRAM을 낮추면서도 마지막 핵심 모듈의 adaptivity는
 
 ```mermaid
 flowchart LR
-    A[등록 순서의 trainable module]
-    A --> B[Sign trunk]
-    A --> C[AdamW cap]
-    B --> D[앞쪽 모듈<br/>decoupled weight decay<br/>EMA(grad)의 sign<br/>state 1개]
-    C --> E[마지막 N개 trainable module<br/>표준 AdamW<br/>state 2개]
+    A["등록 순서의 trainable module"]
+    A --> B["Sign trunk"]
+    A --> C["AdamW cap"]
+    B --> D["앞쪽 모듈<br/>decoupled weight decay<br/>EMA(grad)의 sign<br/>state 1개"]
+    C --> E["마지막 N개 trainable module<br/>표준 AdamW<br/>state 2개"]
 
     classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
     classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;

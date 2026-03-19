@@ -12,12 +12,12 @@ keeping adaptivity where it matters most.
 
 ```mermaid
 flowchart LR
-    A[model.named_modules order]
-    A --> B[direct trainable modules only]
-    B --> C[earlier modules]
-    B --> D[last N modules]
-    C --> E[sign trunk<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor]
-    D --> F[AdamW cap<br/>decoupled weight decay<br/>first and second moments]
+    A["model.named_modules order"]
+    A --> B["direct trainable modules only"]
+    B --> C["earlier modules"]
+    B --> D["last N modules"]
+    C --> E["sign trunk<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor"]
+    D --> F["AdamW cap<br/>decoupled weight decay<br/>first and second moments"]
 
     classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
     classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
