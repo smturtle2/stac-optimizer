@@ -249,6 +249,16 @@ def test_negative_last_n_layers_is_rejected() -> None:
         STAC(model, last_n_layers=-1)
 
 
+def test_invalid_trunk_state_dtype_is_rejected() -> None:
+    model = StackedNet()
+
+    with pytest.raises(ValueError, match="trunk_state_dtype"):
+        STAC(model, trunk_state_dtype=torch.int64)
+
+    with pytest.raises(ValueError, match="trunk_state_dtype"):
+        STAC(model, trunk_state_dtype="nope")
+
+
 def test_requires_at_least_one_trainable_parameter() -> None:
     model = StackedNet()
     for parameter in model.parameters():
@@ -523,6 +533,74 @@ def test_maximize_reverses_update_direction(cuda_device: torch.device) -> None:
         model.trunk.weight.detach(),
         torch.tensor([[1.1]], device=cuda_device),
         atol=1e-6,
+    )
+
+
+def test_cap_maximize_matches_torch_adamw(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    with torch.no_grad():
+        model.head.weight.fill_(1.0)
+
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_layers=2,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        weight_decay=0.01,
+        maximize=True,
+    )
+
+    reference_parameter = nn.Parameter(torch.tensor([[1.0]], device=cuda_device))
+    reference_optimizer = torch.optim.AdamW(
+        [reference_parameter],
+        lr=0.1,
+        betas=(0.9, 0.99),
+        eps=1e-8,
+        weight_decay=0.01,
+        maximize=True,
+    )
+
+    for gradient_value in (0.5, -0.25):
+        model.head.weight.grad = torch.tensor([[gradient_value]], device=cuda_device)
+        reference_parameter.grad = torch.tensor(
+            [[gradient_value]],
+            device=cuda_device,
+        )
+
+        optimizer.step()
+        reference_optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        reference_optimizer.zero_grad(set_to_none=True)
+
+    assert torch.allclose(
+        model.head.weight.detach(),
+        reference_parameter.detach(),
+        atol=1e-6,
+    )
+
+
+def test_trunk_state_dtype_can_use_bfloat16(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_layers=0,
+        trunk_momentum=0.9,
+        trunk_state_dtype=torch.bfloat16,
+    )
+
+    model.trunk.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    optimizer.step()
+
+    assert (
+        optimizer.state[model.trunk.weight]["trunk_momentum_buffer"].dtype
+        == torch.bfloat16
+    )
+    assert (
+        optimizer.state[model.head.weight]["trunk_momentum_buffer"].dtype
+        == torch.bfloat16
     )
 
 

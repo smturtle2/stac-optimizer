@@ -180,6 +180,8 @@ def _batch_indices(
 def _make_optimizer(
     optimizer_kind: str,
     model: nn.Module,
+    *,
+    trunk_state_dtype: torch.dtype | None = None,
 ) -> torch.optim.Optimizer:
     if optimizer_kind == "stac":
         return STAC(
@@ -187,6 +189,7 @@ def _make_optimizer(
             lr=2e-3,
             last_n_layers=1,
             trunk_momentum=0.9,
+            trunk_state_dtype=trunk_state_dtype,
             weight_decay=1e-2,
         )
     if optimizer_kind == "adamw":
@@ -204,6 +207,7 @@ def _run_regression_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
+    trunk_state_dtype: torch.dtype | None = None,
 ) -> float:
     train_inputs, train_targets, val_inputs, val_targets = _make_regression_data(
         seed,
@@ -218,7 +222,11 @@ def _run_regression_trial(
 
     _seed_all(100)
     model = RegressionStudent().to(device)
-    optimizer = _make_optimizer(optimizer_kind, model)
+    optimizer = _make_optimizer(
+        optimizer_kind,
+        model,
+        trunk_state_dtype=trunk_state_dtype,
+    )
 
     for batch_index in batch_schedule:
         index = batch_index.to(device)
@@ -240,6 +248,7 @@ def _run_classification_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
+    trunk_state_dtype: torch.dtype | None = None,
 ) -> tuple[float, float]:
     train_inputs, train_targets, val_inputs, val_targets = (
         _make_classification_data(seed, device=device)
@@ -253,7 +262,11 @@ def _run_classification_trial(
 
     _seed_all(100)
     model = ClassificationStudent().to(device)
-    optimizer = _make_optimizer(optimizer_kind, model)
+    optimizer = _make_optimizer(
+        optimizer_kind,
+        model,
+        trunk_state_dtype=trunk_state_dtype,
+    )
 
     for batch_index in batch_schedule:
         index = batch_index.to(device)
@@ -355,3 +368,70 @@ def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
     adamw_state_bytes = _optimizer_state_bytes(adamw_optimizer)
 
     assert stac_state_bytes < adamw_state_bytes * 0.60
+
+
+def test_bfloat16_trunk_state_reduces_trunk_optimizer_memory_on_cuda(
+    cuda_device: torch.device,
+) -> None:
+    _seed_all(0)
+    fp32_model = StateMemoryNet().to(cuda_device)
+    _seed_all(0)
+    bf16_model = StateMemoryNet().to(cuda_device)
+
+    fp32_optimizer = STAC(
+        fp32_model,
+        lr=2e-3,
+        last_n_layers=0,
+        trunk_momentum=0.9,
+        weight_decay=1e-2,
+    )
+    bf16_optimizer = STAC(
+        bf16_model,
+        lr=2e-3,
+        last_n_layers=0,
+        trunk_momentum=0.9,
+        trunk_state_dtype=torch.bfloat16,
+        weight_decay=1e-2,
+    )
+
+    inputs = torch.randn(128, 256, device=cuda_device)
+    targets = torch.randn(128, 8, device=cuda_device)
+
+    for model, optimizer in (
+        (fp32_model, fp32_optimizer),
+        (bf16_model, bf16_optimizer),
+    ):
+        optimizer.zero_grad(set_to_none=True)
+        predictions = model(inputs)
+        loss = torch.nn.functional.mse_loss(predictions, targets)
+        loss.backward()
+        optimizer.step()
+
+    fp32_state_bytes = _optimizer_state_bytes(fp32_optimizer)
+    bf16_state_bytes = _optimizer_state_bytes(bf16_optimizer)
+
+    assert bf16_state_bytes < fp32_state_bytes * 0.60
+
+
+def test_bfloat16_trunk_state_stays_close_to_default_on_cuda_regression_suite(
+    cuda_device: torch.device,
+) -> None:
+    fp32_losses = [
+        _run_regression_trial(
+            seed,
+            "stac",
+            device=cuda_device,
+        )
+        for seed in range(2)
+    ]
+    bf16_losses = [
+        _run_regression_trial(
+            seed,
+            "stac",
+            device=cuda_device,
+            trunk_state_dtype=torch.bfloat16,
+        )
+        for seed in range(2)
+    ]
+
+    assert statistics.fmean(bf16_losses) <= statistics.fmean(fp32_losses) * 1.15

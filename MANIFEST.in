@@ -1,1 +1,3 @@
 include README.ko.md
+recursive-include docs/benchmark *.json *.png
+recursive-include examples *.py

@@ -10,6 +10,16 @@ from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
 _HYBRID_TRUNK_LR_SCALE = 0.75
+_TRUNK_STATE_DTYPE_ALIASES = {
+    "float16": torch.float16,
+    "half": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float64": torch.float64,
+    "fp64": torch.float64,
+}
 
 
 @dataclass(frozen=True)
@@ -169,6 +179,10 @@ class STAC(Optimizer):
     STAC use ``0.75 * lr`` for the sign trunk and ``lr`` for the AdamW cap.
     This keeps the sign-based path slightly more conservative by default.
 
+    The sign trunk can keep its momentum buffer in a lower-precision floating
+    dtype via ``trunk_state_dtype``. This is useful when you want to reduce
+    optimizer-state VRAM further without changing the cap behavior.
+
     With the default ``error_if_nonfinite=False``, STAC skips the entire step
     when it encounters a non-finite dense gradient. This avoids silently
     zeroing sign updates in the trunk or contaminating AdamW moments in the
@@ -189,6 +203,7 @@ class STAC(Optimizer):
         cap_lr: float | None = None,
         last_n_layers: int = 1,
         trunk_momentum: float = 0.9,
+        trunk_state_dtype: torch.dtype | str | None = None,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
@@ -211,6 +226,10 @@ class STAC(Optimizer):
                 AdamW. Earlier trainable layers use the sign-based trunk.
             trunk_momentum: EMA factor applied before taking the sign in the
                 trunk. Set ``0.0`` to recover plain signSGD.
+            trunk_state_dtype: Optional floating dtype used for the trunk
+                momentum buffer. Leave unset to match each parameter dtype.
+                Useful for reducing optimizer-state VRAM, for example with
+                ``torch.bfloat16`` on CUDA.
             betas: AdamW first- and second-moment coefficients for the cap.
             eps: Numerical stability term for the AdamW cap.
             weight_decay: Shared decoupled weight decay applied to both roles
@@ -235,6 +254,9 @@ class STAC(Optimizer):
             raise ValueError(
                 f"Invalid trunk_momentum value: {trunk_momentum}."
             )
+        resolved_trunk_state_dtype = self._resolve_trunk_state_dtype(
+            trunk_state_dtype
+        )
 
         partition = partition_trainable_layers(
             model,
@@ -274,6 +296,7 @@ class STAC(Optimizer):
                     "lr": trunk_lr,
                     "weight_decay": trunk_weight_decay,
                     "trunk_momentum": trunk_momentum,
+                    "trunk_state_dtype": resolved_trunk_state_dtype,
                 }
             )
         if self.partition.cap_layers:
@@ -293,6 +316,7 @@ class STAC(Optimizer):
             "trunk_lr": trunk_lr,
             "cap_lr": cap_lr,
             "trunk_momentum": trunk_momentum,
+            "trunk_state_dtype": resolved_trunk_state_dtype,
             "betas": betas,
             "eps": eps,
             "weight_decay": weight_decay,
@@ -312,6 +336,36 @@ class STAC(Optimizer):
     def _validate_nonnegative(name: str, value: float) -> None:
         if value < 0.0:
             raise ValueError(f"Invalid {name}: {value}.")
+
+    @staticmethod
+    def _resolve_trunk_state_dtype(
+        value: torch.dtype | str | None,
+    ) -> torch.dtype | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            normalized_value = value.strip().lower()
+            if normalized_value in {"parameter", "match_parameter"}:
+                return None
+            resolved_value = _TRUNK_STATE_DTYPE_ALIASES.get(normalized_value)
+            if resolved_value is None:
+                raise ValueError(
+                    "trunk_state_dtype must be a floating torch.dtype, None, "
+                    "or one of: "
+                    f"{', '.join(sorted(_TRUNK_STATE_DTYPE_ALIASES))}."
+                )
+            value = resolved_value
+
+        if not isinstance(value, torch.dtype):
+            raise ValueError(
+                "trunk_state_dtype must be a floating torch.dtype, None, or "
+                "a supported string alias."
+            )
+        if not torch.empty((), dtype=value).is_floating_point():
+            raise ValueError(
+                "trunk_state_dtype must be a floating-point dtype."
+            )
+        return value
 
     def add_param_group(self, param_group: dict[str, object]) -> None:
         if getattr(self, "_initializing", False):
@@ -333,6 +387,7 @@ class STAC(Optimizer):
             group.setdefault("layer_names", ())
             group.setdefault("param_names", ())
             group.setdefault("trunk_momentum", 0.0)
+            group.setdefault("trunk_state_dtype", None)
             group.setdefault("betas", (0.9, 0.999))
             group.setdefault("eps", 1e-8)
             group.setdefault("amsgrad", False)
@@ -378,6 +433,7 @@ class STAC(Optimizer):
         weight_decay = float(group["weight_decay"])
         maximize = bool(group["maximize"])
         trunk_momentum = float(group["trunk_momentum"])
+        trunk_state_dtype = group["trunk_state_dtype"]
         parameters: list[torch.Tensor] = []
         updates: list[torch.Tensor] = []
         momentum_buffers: list[torch.Tensor] = []
@@ -395,9 +451,15 @@ class STAC(Optimizer):
             if trunk_momentum != 0.0:
                 state = self.state[parameter]
                 momentum_buffer = state.get("trunk_momentum_buffer")
+                buffer_dtype = (
+                    parameter.dtype
+                    if trunk_state_dtype is None
+                    else trunk_state_dtype
+                )
                 if momentum_buffer is None:
                     momentum_buffer = state["trunk_momentum_buffer"] = torch.zeros_like(
                         parameter,
+                        dtype=buffer_dtype,
                         memory_format=torch.preserve_format,
                     )
                 momentum_buffers.append(momentum_buffer)
@@ -410,12 +472,36 @@ class STAC(Optimizer):
                 torch._foreach_mul_(parameters, 1 - lr * weight_decay)
 
             if trunk_momentum != 0.0:
+                buffer_updates = [
+                    update.to(dtype=momentum_buffer.dtype)
+                    if update.dtype != momentum_buffer.dtype
+                    else update
+                    for update, momentum_buffer in zip(
+                        updates,
+                        momentum_buffers,
+                        strict=True,
+                    )
+                ]
                 torch._foreach_mul_(momentum_buffers, trunk_momentum)
-                torch._foreach_add_(momentum_buffers, updates, alpha=1 - trunk_momentum)
+                torch._foreach_add_(
+                    momentum_buffers,
+                    buffer_updates,
+                    alpha=1 - trunk_momentum,
+                )
                 directions = torch._foreach_sign(momentum_buffers)
             else:
                 directions = torch._foreach_sign(updates)
 
+            directions = [
+                direction.to(dtype=parameter.dtype)
+                if direction.dtype != parameter.dtype
+                else direction
+                for direction, parameter in zip(
+                    directions,
+                    parameters,
+                    strict=True,
+                )
+            ]
             torch._foreach_add_(parameters, directions, alpha=-lr)
             return
 
@@ -425,14 +511,21 @@ class STAC(Optimizer):
 
             if trunk_momentum != 0.0:
                 momentum_buffer = momentum_buffers[index]
+                buffer_update = (
+                    updates[index].to(dtype=momentum_buffer.dtype)
+                    if updates[index].dtype != momentum_buffer.dtype
+                    else updates[index]
+                )
                 momentum_buffer.mul_(trunk_momentum).add_(
-                    updates[index],
+                    buffer_update,
                     alpha=1 - trunk_momentum,
                 )
                 direction = momentum_buffer.sign()
             else:
                 direction = updates[index].sign()
 
+            if direction.dtype != parameter.dtype:
+                direction = direction.to(dtype=parameter.dtype)
             parameter.add_(direction, alpha=-lr)
 
     def _step_adamw(self, group: dict[str, object]) -> None:

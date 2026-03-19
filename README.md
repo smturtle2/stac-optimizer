@@ -5,59 +5,42 @@
 [![Torch >= 2.10](https://img.shields.io/badge/torch-%3E%3D2.10-ee4c2c)](https://pytorch.org/)
 [![CI](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml/badge.svg)](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml)
 
-[Korean README](README.ko.md)
+[한국어 README](https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md)
 
 STAC stands for SignSGD Trunk, AdamW Cap.
 
-It is a PyTorch optimizer for models where you want sign-based updates through
-most of the network, but still want AdamW on the last few trainable layers
-where optimization is usually more sensitive. The trunk uses
-`sign(momentum-smoothed gradient)` by default because momentum-stabilized sign
-methods are materially more reliable than plain `sign(grad)` in both theory and
-practice.
+It is a PyTorch optimizer that keeps the earlier trainable layers on a
+momentum-stabilized sign trunk and the last `N` trainable layers on AdamW.
+The goal is simple: keep optimizer-state VRAM lower than full AdamW while
+preserving strong optimization behavior where adaptive updates matter most.
 
 | Item | Value |
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
 | Default split | last `1` trainable layer uses AdamW |
-| Trunk update | decoupled weight decay + `sign(EMA(grad))` |
-| Cap update | AdamW with decoupled weight decay |
-| CUDA validation | local tests and benchmark suite |
-
-## Why STAC
-
-- Keeps the bulk of the model on sign-based updates.
-- Preserves AdamW on the last `N` trainable layers.
-- Uses materially less optimizer state than full AdamW when only the cap keeps
-  adaptive moments.
-- Uses deterministic partitioning based on `model.named_modules()`.
-- Exposes the chosen split through `optimizer.partition`.
-- Rejects sparse gradients and dynamic `add_param_group()` explicitly.
-- Skips the whole step on non-finite dense gradients unless
-  `error_if_nonfinite=True`.
-- Validates optimizer checkpoints against layer names, parameter names, and
-  saved state shapes.
+| Trunk | decoupled weight decay + `sign(EMA(grad))` |
+| Cap | AdamW with decoupled weight decay |
+| Extra VRAM knob | `trunk_state_dtype=torch.bfloat16` |
+| Validation | local CUDA test suite + research benchmark |
 
 ## Optimizer Layout
 
 ```mermaid
 flowchart LR
-    A[Trainable layers in registration order] --> B[Earlier layers]
-    A --> C[Last N layers]
-    B --> D[STAC trunk<br/>decoupled weight decay<br/>EMA(grad) -> sign update]
-    C --> E[STAC cap<br/>AdamW<br/>decoupled weight decay]
+    A[Trainable layers in registration order] --> B[Earlier trainable layers]
+    A --> C[Last N trainable layers]
+    B --> D[Sign trunk<br/>decoupled weight decay<br/>EMA(grad) -> sign update<br/>optional bf16 state]
+    C --> E[AdamW cap<br/>decoupled weight decay]
 ```
 
 ## Installation
-
-Install from PyPI:
 
 ```bash
 python -m pip install stac-optimizer
 ```
 
-Install the local repository for development:
+For local development:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -85,9 +68,8 @@ optimizer = STAC(
     lr=1e-3,
     last_n_layers=1,
     trunk_momentum=0.9,
-    trunk_lr=8e-4,
-    cap_lr=1e-3,
     weight_decay=1e-2,
+    trunk_state_dtype=torch.bfloat16,
     error_if_nonfinite=True,
 )
 
@@ -100,155 +82,112 @@ optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 
 print("trunk layers:", optimizer.partition.trunk_layer_names)
-print("trunk params:", optimizer.partition.trunk_parameter_names)
 print("cap layers:", optimizer.partition.cap_layer_names)
-print("cap params:", optimizer.partition.cap_parameter_names)
 ```
 
-## Partition Rules
+## Why This Design
 
-STAC walks `model.named_modules()` in registration order and treats each module
-that owns trainable parameters directly (`recurse=False`) as one layer.
+- [signSGD: Compressed Optimisation for Non-Convex Problems](https://arxiv.org/abs/1802.04434)
+  motivates sign-based updates as a low-state alternative to adaptive methods.
+- [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html)
+  supports using momentum before taking the sign instead of raw `sign(grad)`.
+- [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101)
+  supports the AdamW-style decoupled decay used in the cap.
+- [Deconstructing What Makes a Good Optimizer for Autoregressive Language Models](https://openreview.net/forum?id=zfeso8ceqr)
+  argues that much of the benefit of adaptivity can come from a small subset of
+  parameters, which is the main motivation for concentrating AdamW in the cap.
 
-- The final `last_n_layers` trainable layers become the AdamW cap.
-- Frozen parameters are skipped when counting layers.
-- Shared parameters are assigned to the first discovered owner.
-- Root-level parameters are exposed as `"<root>"`.
-- `last_n_layers=0` keeps the whole model in the sign-based trunk.
-- Oversized `last_n_layers` moves the whole model into the AdamW cap.
+This does not mean one fixed STAC setting is best on every task. Local CUDA
+investigation on this repository showed a real tradeoff:
+
+- `trunk_lr=lr` fits small dense toy problems faster.
+- The default conservative split (`trunk_lr=0.75 * lr`) was slightly more
+  stable on the held-out teacher/student benchmark below.
+
+Treat `trunk_lr` as a tuning knob, not a universal constant.
+
+## CUDA Research Benchmark
+
+Primary benchmark script:
+[examples/research_benchmark.py](https://github.com/smturtle2/stac-optimizer/blob/main/examples/research_benchmark.py)
+
+Machine-readable report:
+[docs/benchmark/research_benchmark.json](https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json)
+
+Methodology:
+
+- CUDA only
+- separate train/validation splits
+- `5` seeds
+- `12` epochs and `20` updates per epoch
+- reports epoch-by-epoch validation loss curves
+- measures optimizer state plus peak CUDA allocated/reserved memory on first step
+
+Snapshot from `2026-03-19` on `torch 2.10.0+cu126` and `NVIDIA GeForce RTX 3070`:
+
+![STAC CUDA research benchmark](https://raw.githubusercontent.com/smturtle2/stac-optimizer/main/docs/benchmark/research_benchmark.png)
+
+Regression validation loss:
+
+| Optimizer | Final val loss mean | Final val loss range |
+| --- | ---: | ---: |
+| `STAC` default (`cap=1`) | `0.046044` | `0.044386 - 0.047686` |
+| `STAC` matched trunk lr | `0.046207` | `0.044730 - 0.047581` |
+| `STAC` plain sign trunk | `0.043162` | `0.041903 - 0.044614` |
+| `AdamW` baseline | `0.043753` | `0.042771 - 0.045108` |
+
+Classification validation:
+
+| Optimizer | Final val loss mean | Final val loss range | Final val acc mean |
+| --- | ---: | ---: | ---: |
+| `STAC` default (`cap=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
+| `STAC` matched trunk lr | `0.323920` | `0.287477 - 0.333865` | `0.8828` |
+| `STAC` plain sign trunk | `0.314426` | `0.279694 - 0.330161` | `0.9039` |
+| `AdamW` baseline | `0.304733` | `0.275815 - 0.317797` | `0.9074` |
+
+Memory probe:
+
+| Optimizer | Optimizer state MB | Peak allocated MB | Peak reserved MB |
+| --- | ---: | ---: | ---: |
+| `STAC` default (`cap=1`) | `3.637` | `31.925` | `38.000` |
+| `STAC` matched trunk lr | `3.637` | `31.925` | `38.000` |
+| `STAC` plain sign trunk | `0.004` | `28.292` | `34.000` |
+| `AdamW` baseline | `7.270` | `35.565` | `40.000` |
+
+This benchmark is evidence, not a universal leaderboard. It is meant to answer
+two practical questions for this repository:
+
+- Does STAC remain competitive with AdamW on held-out CUDA tasks?
+- Does STAC reduce optimizer-state and peak-memory pressure in practice?
 
 ## Public API
 
-The public package exports:
+The package exports:
 
-- `STAC`: the optimizer itself.
-- `partition_trainable_layers(model, last_n_layers=1)`: inspect the split
-  without constructing the optimizer.
-- `LayerGroup`: one trainable module slice with `name`, `parameter_names`, and
-  `parameters`.
-- `STACPartition`: immutable split metadata with
-  `trunk_layer_names`, `cap_layer_names`,
-  `trunk_parameter_names`, `cap_parameter_names`,
-  `trunk_parameters`, and `cap_parameters`.
+- `STAC`
+- `partition_trainable_layers(model, last_n_layers=1)`
+- `LayerGroup`
+- `STACPartition`
 
-## Design Notes
+Useful runtime guarantees:
 
-The defaults are intentionally conservative:
-
-- The trunk uses momentum because momentum-smoothed sign methods are more
-  stable than plain sign-only updates. See
-  [signSGD: Compressed Optimisation for Non-Convex Problems](https://arxiv.org/abs/1802.04434)
-  and
-  [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html).
-- The cap uses AdamW-style decoupled weight decay rather than mixing weight
-  decay into the gradient. See
-  [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101).
-- Layer selection stays explicit because sign-based and adaptive methods have
-  different tradeoffs depending on noise, conditioning, and where adaptation is
-  most useful in the network.
-
-Practical tuning guidance:
-
-- If training is unstable, increase `trunk_momentum` before increasing
-  `trunk_lr`.
-- If the head adapts too slowly, increase `cap_lr`.
-- If the model underfits, move more layers into the cap by increasing
-  `last_n_layers`.
-
-## CUDA Benchmark Suite
-
-The repository includes [`examples/toy_benchmark.py`](examples/toy_benchmark.py),
-which runs synthetic regression and classification tasks across multiple seeds
-on CUDA. It compares:
-
-- `STAC default (cap=1)`
-- `STAC plain sign trunk`
-- `STAC wider cap (cap=2)`
-- `AdamW baseline`
-
-Run it with:
-
-```bash
-python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150
-```
-
-Verified local snapshot from `2026-03-18` on `torch 2.10.0+cu126` and an
-`NVIDIA GeForce RTX 3070`:
-
-| Task | STAC default | Plain sign trunk | Wider cap (`last_n_layers=2`) | AdamW |
-| --- | ---: | ---: | ---: | ---: |
-| Regression mean loss | `0.075852` | `0.140853` | `0.077104` | `0.118262` |
-| Classification mean loss | `0.006573` | `0.022765` | `0.011192` | `0.017693` |
-
-Representative optimizer-state snapshot on the same machine from the benchmark's
-deeper memory probe:
-
-| Optimizer | Optimizer state MB |
-| --- | ---: |
-| `STAC` default | `3.637` |
-| `STAC` plain sign trunk | `0.004` |
-| `STAC` wider cap | `3.762` |
-| `AdamW` | `7.270` |
-
-This benchmark is designed as a reproducible sanity check, not a universal
-leaderboard. It focuses on optimization quality and optimizer-state memory
-rather than claiming a universal wall-clock speedup.
+- deterministic trunk/cap partitioning based on `model.named_modules()`
+- explicit rejection of sparse gradients
+- whole-step skip on non-finite dense gradients unless
+  `error_if_nonfinite=True`
+- checkpoint validation against saved layer names, parameter names, and state
+  tensor shapes
 
 ## Verification
-
-Local CUDA verification:
 
 ```bash
 python -m pytest -q
 python -m build
 python -m twine check dist/*
-python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150
+python examples/research_benchmark.py --device cuda
 ```
 
-Most recent local CUDA run on `2026-03-18`:
-
-- `python -m pytest -q`: `28 passed`
-- `python examples/toy_benchmark.py --device cuda --seeds 5 --steps 150`:
-  produced the tables above
-
-What the test suite covers:
-
-- deterministic partitioning behavior
-- optimizer-step parity against AdamW for the cap
-- sparse-gradient and non-finite gradient safeguards
-- checkpoint round-trips and mismatch rejection
-- CUDA comparisons showing the default trunk beating plain signSGD on both
-  regression and classification tasks
-- CUDA integration checks showing STAC stays competitive with AdamW while
-  using materially less optimizer state
-
-GitHub Actions automation:
-
-- On pull requests and pushes to `main`: CPU tests, packaging, and wheel smoke
-  checks.
-- On `v*` tags: version validation, rebuild, `twine check`, PyPI publishing,
-  and GitHub Release creation.
-
-## Release
-
-This project uses `setuptools-scm`, so releases are created from Git tags.
-Repository changelog entries live in GitHub Releases rather than a committed
-`CHANGELOG.md`.
-
-Typical release flow:
-
-```bash
-git push origin main
-git tag vX.Y.Z
-git push origin vX.Y.Z
-```
-
-The tag workflow then:
-
-1. Verifies that `vX.Y.Z` matches the computed package version.
-2. Builds fresh distributions and runs `twine check`.
-3. Publishes to PyPI via GitHub Actions Trusted Publishing.
-4. Creates the matching GitHub Release and attaches the built artifacts.
-
-PyPI Trusted Publishing must be configured for this repository and
-`.github/workflows/workflow.yml` before the publish step can succeed.
+The repository also keeps the older quick smoke benchmark at
+[examples/toy_benchmark.py](https://github.com/smturtle2/stac-optimizer/blob/main/examples/toy_benchmark.py)
+for fast sanity checks, but the research benchmark above is the primary CUDA
+evidence for README claims.
