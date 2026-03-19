@@ -181,15 +181,15 @@ def _make_optimizer(
     optimizer_kind: str,
     model: nn.Module,
     *,
-    trunk_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | None = None,
 ) -> torch.optim.Optimizer:
     if optimizer_kind == "stac":
         return STAC(
             model,
             lr=2e-3,
             last_n_layers=1,
-            trunk_momentum=0.9,
-            trunk_state_dtype=trunk_state_dtype,
+            sign_momentum=0.9,
+            sign_state_dtype=sign_state_dtype,
             weight_decay=1e-2,
         )
     if optimizer_kind == "adamw":
@@ -207,7 +207,7 @@ def _run_regression_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
-    trunk_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | None = None,
 ) -> float:
     train_inputs, train_targets, val_inputs, val_targets = _make_regression_data(
         seed,
@@ -225,7 +225,7 @@ def _run_regression_trial(
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
-        trunk_state_dtype=trunk_state_dtype,
+        sign_state_dtype=sign_state_dtype,
     )
 
     for batch_index in batch_schedule:
@@ -248,7 +248,7 @@ def _run_classification_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
-    trunk_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | None = None,
 ) -> tuple[float, float]:
     train_inputs, train_targets, val_inputs, val_targets = (
         _make_classification_data(seed, device=device)
@@ -265,7 +265,7 @@ def _run_classification_trial(
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
-        trunk_state_dtype=trunk_state_dtype,
+        sign_state_dtype=sign_state_dtype,
     )
 
     for batch_index in batch_schedule:
@@ -342,7 +342,7 @@ def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
         stac_model,
         lr=2e-3,
         last_n_layers=1,
-        trunk_momentum=0.9,
+        sign_momentum=0.9,
         weight_decay=1e-2,
     )
     adamw_optimizer = torch.optim.AdamW(
@@ -370,7 +370,7 @@ def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
     assert stac_state_bytes < adamw_state_bytes * 0.60
 
 
-def test_bfloat16_trunk_state_reduces_trunk_optimizer_memory_on_cuda(
+def test_bfloat16_sign_state_reduces_sign_optimizer_memory_on_cuda(
     cuda_device: torch.device,
 ) -> None:
     _seed_all(0)
@@ -382,15 +382,15 @@ def test_bfloat16_trunk_state_reduces_trunk_optimizer_memory_on_cuda(
         fp32_model,
         lr=2e-3,
         last_n_layers=0,
-        trunk_momentum=0.9,
+        sign_momentum=0.9,
         weight_decay=1e-2,
     )
     bf16_optimizer = STAC(
         bf16_model,
         lr=2e-3,
         last_n_layers=0,
-        trunk_momentum=0.9,
-        trunk_state_dtype=torch.bfloat16,
+        sign_momentum=0.9,
+        sign_state_dtype=torch.bfloat16,
         weight_decay=1e-2,
     )
 
@@ -413,7 +413,7 @@ def test_bfloat16_trunk_state_reduces_trunk_optimizer_memory_on_cuda(
     assert bf16_state_bytes < fp32_state_bytes * 0.60
 
 
-def test_bfloat16_trunk_state_stays_close_to_default_on_cuda_regression_suite(
+def test_bfloat16_sign_state_stays_close_to_default_on_cuda_regression_suite(
     cuda_device: torch.device,
 ) -> None:
     fp32_losses = [
@@ -429,7 +429,7 @@ def test_bfloat16_trunk_state_stays_close_to_default_on_cuda_regression_suite(
             seed,
             "stac",
             device=cuda_device,
-            trunk_state_dtype=torch.bfloat16,
+            sign_state_dtype=torch.bfloat16,
         )
         for seed in range(2)
     ]

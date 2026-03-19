@@ -29,9 +29,8 @@ class BenchmarkConfig:
     label: str
     optimizer_kind: str
     lr: float = 2e-3
-    trunk_lr: float | None = None
     last_n_layers: int = 1
-    trunk_momentum: float = 0.9
+    sign_momentum: float = 0.9
     weight_decay: float = 1e-2
     color: str = "#1f77b4"
     linestyle: str = "-"
@@ -224,9 +223,8 @@ def build_optimizer(
         return STAC(
             model,
             lr=config.lr,
-            trunk_lr=config.trunk_lr,
             last_n_layers=config.last_n_layers,
-            trunk_momentum=config.trunk_momentum,
+            sign_momentum=config.sign_momentum,
             weight_decay=config.weight_decay,
         )
     if config.optimizer_kind == "adamw":
@@ -657,22 +655,22 @@ def main() -> None:
 
     configs = [
         BenchmarkConfig(
-            label="STAC default (cap=1)",
+            label="STAC default (last_n_layers=1)",
             optimizer_kind="stac",
             color="#0f766e",
             linestyle="-",
         ),
         BenchmarkConfig(
-            label="STAC matched trunk lr",
+            label="STAC wider AdamW section (last_n_layers=2)",
             optimizer_kind="stac",
-            trunk_lr=2e-3,
+            last_n_layers=2,
             color="#c2410c",
             linestyle="-.",
         ),
         BenchmarkConfig(
-            label="STAC plain sign trunk",
+            label="STAC plain sign update",
             optimizer_kind="stac",
-            trunk_momentum=0.0,
+            sign_momentum=0.0,
             color="#9333ea",
             linestyle="--",
         ),

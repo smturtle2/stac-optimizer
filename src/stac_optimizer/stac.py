@@ -9,8 +9,8 @@ from torch import nn
 from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
-_HYBRID_TRUNK_LR_SCALE = 0.75
-_TRUNK_STATE_DTYPE_ALIASES = {
+_HYBRID_SIGN_LR_SCALE = 0.75
+_SIGN_STATE_DTYPE_ALIASES = {
     "float16": torch.float16,
     "half": torch.float16,
     "bfloat16": torch.bfloat16,
@@ -40,59 +40,59 @@ class LayerGroup:
 
 @dataclass(frozen=True)
 class STACPartition:
-    """Deterministic split of trainable layers into the sign trunk and AdamW cap.
+    """Deterministic split of trainable layers into sign and AdamW sections.
 
     The partition preserves trainable layer order from
     :func:`torch.nn.Module.named_modules`, which makes the split stable across
     repeated construction for the same model definition.
     """
 
-    trunk_layers: tuple[LayerGroup, ...]
-    cap_layers: tuple[LayerGroup, ...]
+    sign_layers: tuple[LayerGroup, ...]
+    adamw_layers: tuple[LayerGroup, ...]
 
     @property
-    def trunk_layer_names(self) -> tuple[str, ...]:
-        """Names of trainable layers updated by the sign-based trunk."""
-        return tuple(layer.name for layer in self.trunk_layers)
+    def sign_layer_names(self) -> tuple[str, ...]:
+        """Names of trainable layers updated by the sign-based section."""
+        return tuple(layer.name for layer in self.sign_layers)
 
     @property
-    def cap_layer_names(self) -> tuple[str, ...]:
-        """Names of trainable layers updated by the AdamW cap."""
-        return tuple(layer.name for layer in self.cap_layers)
+    def adamw_layer_names(self) -> tuple[str, ...]:
+        """Names of trainable layers updated by the AdamW section."""
+        return tuple(layer.name for layer in self.adamw_layers)
 
     @property
-    def trunk_parameter_names(self) -> tuple[str, ...]:
-        """Flattened parameter names that belong to the sign-based trunk."""
+    def sign_parameter_names(self) -> tuple[str, ...]:
+        """Flattened parameter names that belong to the sign-based section."""
         return tuple(
             parameter_name
-            for layer in self.trunk_layers
+            for layer in self.sign_layers
             for parameter_name in layer.parameter_names
         )
 
     @property
-    def cap_parameter_names(self) -> tuple[str, ...]:
-        """Flattened parameter names that belong to the AdamW cap."""
+    def adamw_parameter_names(self) -> tuple[str, ...]:
+        """Flattened parameter names that belong to the AdamW section."""
         return tuple(
             parameter_name
-            for layer in self.cap_layers
+            for layer in self.adamw_layers
             for parameter_name in layer.parameter_names
         )
 
     @property
-    def trunk_parameters(self) -> tuple[nn.Parameter, ...]:
-        """Flattened trainable parameters that belong to the sign-based trunk."""
+    def sign_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Flattened trainable parameters that belong to the sign-based section."""
         return tuple(
             parameter
-            for layer in self.trunk_layers
+            for layer in self.sign_layers
             for parameter in layer.parameters
         )
 
     @property
-    def cap_parameters(self) -> tuple[nn.Parameter, ...]:
-        """Flattened trainable parameters that belong to the AdamW cap."""
+    def adamw_parameters(self) -> tuple[nn.Parameter, ...]:
+        """Flattened trainable parameters that belong to the AdamW section."""
         return tuple(
             parameter
-            for layer in self.cap_layers
+            for layer in self.adamw_layers
             for parameter in layer.parameters
         )
 
@@ -102,20 +102,20 @@ def partition_trainable_layers(
     *,
     last_n_layers: int = 1,
 ) -> STACPartition:
-    """Split a model into a sign trunk and AdamW cap by trainable layer order.
+    """Split a model into sign and AdamW sections by trainable layer order.
 
     STAC walks ``model.named_modules()`` in registration order and treats each
     module that owns trainable parameters directly as one layer. The final
-    ``last_n_layers`` layers become the AdamW cap; everything before that stays
-    in the sign-based trunk.
+    ``last_n_layers`` layers become the AdamW section; everything before that
+    stays in the sign-based section.
 
     Args:
         model: Module whose trainable parameters should be partitioned.
         last_n_layers: Number of final trainable layers that should use AdamW.
 
     Returns:
-        A deterministic partition describing which layers belong to the trunk
-        and which belong to the cap.
+        A deterministic partition describing which layers belong to the sign
+        section and which belong to the AdamW section.
 
     Raises:
         ValueError: If ``last_n_layers`` is negative or the model has no
@@ -157,39 +157,41 @@ def partition_trainable_layers(
     if not layer_groups:
         raise ValueError("STAC requires at least one trainable parameter.")
 
-    trunk_count = max(len(layer_groups) - last_n_layers, 0)
+    sign_count = max(len(layer_groups) - last_n_layers, 0)
     return STACPartition(
-        trunk_layers=tuple(layer_groups[:trunk_count]),
-        cap_layers=tuple(layer_groups[trunk_count:]),
+        sign_layers=tuple(layer_groups[:sign_count]),
+        adamw_layers=tuple(layer_groups[sign_count:]),
     )
 
 
 class STAC(Optimizer):
-    r"""SignSGD trunk with an AdamW cap over the last N trainable layers.
+    r"""SignSGD section with an AdamW section over the last N trainable layers.
 
     Layer discovery is deterministic: STAC walks ``model.named_modules()`` in
     registration order and treats each module that owns trainable parameters
     directly (``recurse=False``) as one layer. The final ``last_n_layers`` of
     that ordered list use AdamW, while all earlier layers use a sign-based
-    trunk update. By default the trunk accumulates gradients with momentum
+    update. By default the sign-based section accumulates gradients with momentum
     before taking the sign, which is markedly more stable than plain signSGD.
-    Set ``trunk_momentum=0.0`` to recover textbook signSGD.
+    Set ``sign_momentum=0.0`` to recover textbook signSGD.
 
-    When both the trunk and cap are active, leaving ``trunk_lr`` unset makes
-    STAC use ``0.75 * lr`` for the sign trunk and ``lr`` for the AdamW cap.
-    This keeps the sign-based path slightly more conservative by default.
+    When both sections are active, STAC internally uses ``0.75 * lr`` for the
+    sign-based section and ``lr`` for the AdamW section. This keeps the sign
+    path slightly more conservative while preserving a single public learning
+    rate knob.
 
-    The sign trunk can keep its momentum buffer in a lower-precision floating
-    dtype via ``trunk_state_dtype``. This is useful when you want to reduce
-    optimizer-state VRAM further without changing the cap behavior.
+    The sign-based section can keep its momentum buffer in a lower-precision
+    floating dtype via ``sign_state_dtype``. This is useful when you want to
+    reduce optimizer-state VRAM further without changing the AdamW behavior.
 
     With the default ``error_if_nonfinite=False``, STAC skips the entire step
     when it encounters a non-finite dense gradient. This avoids silently
-    zeroing sign updates in the trunk or contaminating AdamW moments in the
-    cap. Set ``error_if_nonfinite=True`` to raise immediately instead.
+    zeroing sign updates in the sign-based section or contaminating AdamW
+    moments in the final section. Set ``error_if_nonfinite=True`` to raise
+    immediately instead.
 
     Attributes:
-        partition: Deterministic trunk/cap split derived from model structure.
+        partition: Deterministic sign/AdamW split derived from model structure.
         nonfinite_skipped_steps: Number of skipped :meth:`step` calls caused by
             non-finite dense gradients while ``error_if_nonfinite=False``.
     """
@@ -199,16 +201,14 @@ class STAC(Optimizer):
         model: nn.Module,
         *,
         lr: float = 1e-3,
-        trunk_lr: float | None = None,
-        cap_lr: float | None = None,
         last_n_layers: int = 1,
-        trunk_momentum: float = 0.9,
-        trunk_state_dtype: torch.dtype | str | None = None,
+        sign_momentum: float = 0.9,
+        sign_state_dtype: torch.dtype | str | None = None,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
-        trunk_weight_decay: float | None = None,
-        cap_weight_decay: float | None = None,
+        sign_weight_decay: float | None = None,
+        adamw_weight_decay: float | None = None,
         amsgrad: bool = False,
         maximize: bool = False,
         error_if_nonfinite: bool = False,
@@ -217,26 +217,25 @@ class STAC(Optimizer):
 
         Args:
             model: Module whose trainable parameters should be optimized.
-            lr: Shared base learning rate. The AdamW cap uses this value unless
-                ``cap_lr`` overrides it.
-            trunk_lr: Learning rate for the sign-based trunk. In hybrid mode,
-                leaving this unset defaults to ``0.75 * lr``.
-            cap_lr: Learning rate for the AdamW cap. Defaults to ``lr``.
+            lr: Shared base learning rate. In hybrid mode, STAC internally uses
+                ``0.75 * lr`` for the sign-based section and ``lr`` for the
+                AdamW section.
             last_n_layers: Number of final trainable layers that should use
-                AdamW. Earlier trainable layers use the sign-based trunk.
-            trunk_momentum: EMA factor applied before taking the sign in the
-                trunk. Set ``0.0`` to recover plain signSGD.
-            trunk_state_dtype: Optional floating dtype used for the trunk
+                AdamW. Earlier trainable layers use the sign-based section.
+            sign_momentum: EMA factor applied before taking the sign in the
+                sign-based section. Set ``0.0`` to recover plain signSGD.
+            sign_state_dtype: Optional floating dtype used for the sign-section
                 momentum buffer. Leave unset to match each parameter dtype.
                 Useful for reducing optimizer-state VRAM, for example with
                 ``torch.bfloat16`` on CUDA.
-            betas: AdamW first- and second-moment coefficients for the cap.
-            eps: Numerical stability term for the AdamW cap.
+            betas: AdamW first- and second-moment coefficients for the AdamW
+                section.
+            eps: Numerical stability term for the AdamW section.
             weight_decay: Shared decoupled weight decay applied to both roles
                 unless overridden.
-            trunk_weight_decay: Decoupled weight decay for the trunk.
-            cap_weight_decay: Decoupled weight decay for the cap.
-            amsgrad: Enable the AMSGrad variant for the AdamW cap.
+            sign_weight_decay: Decoupled weight decay for the sign-based section.
+            adamw_weight_decay: Decoupled weight decay for the AdamW section.
+            amsgrad: Enable the AMSGrad variant for the AdamW section.
             maximize: Maximize the objective instead of minimizing it.
             error_if_nonfinite: Raise ``RuntimeError`` when a gradient contains
                 ``NaN`` or ``Inf`` values. If ``False``, STAC skips the entire
@@ -250,78 +249,72 @@ class STAC(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 0: {beta1}.")
         if not 0.0 <= beta2 < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {beta2}.")
-        if not 0.0 <= trunk_momentum < 1.0:
+        if not 0.0 <= sign_momentum < 1.0:
             raise ValueError(
-                f"Invalid trunk_momentum value: {trunk_momentum}."
+                f"Invalid sign_momentum value: {sign_momentum}."
             )
-        resolved_trunk_state_dtype = self._resolve_trunk_state_dtype(
-            trunk_state_dtype
+        resolved_sign_state_dtype = self._resolve_sign_state_dtype(
+            sign_state_dtype
         )
 
         partition = partition_trainable_layers(
             model,
             last_n_layers=last_n_layers,
         )
-        default_trunk_lr = (
-            lr * _HYBRID_TRUNK_LR_SCALE
-            if partition.trunk_layers and partition.cap_layers
+        default_sign_lr = (
+            lr * _HYBRID_SIGN_LR_SCALE
+            if partition.sign_layers and partition.adamw_layers
             else lr
         )
-        trunk_lr = default_trunk_lr if trunk_lr is None else trunk_lr
-        cap_lr = lr if cap_lr is None else cap_lr
-        trunk_weight_decay = (
-            weight_decay if trunk_weight_decay is None else trunk_weight_decay
+        sign_weight_decay = (
+            weight_decay if sign_weight_decay is None else sign_weight_decay
         )
-        cap_weight_decay = (
-            weight_decay if cap_weight_decay is None else cap_weight_decay
+        adamw_weight_decay = (
+            weight_decay if adamw_weight_decay is None else adamw_weight_decay
         )
 
-        self._validate_nonnegative("trunk_lr", trunk_lr)
-        self._validate_nonnegative("cap_lr", cap_lr)
-        self._validate_nonnegative("trunk_weight_decay", trunk_weight_decay)
-        self._validate_nonnegative("cap_weight_decay", cap_weight_decay)
+        self._validate_nonnegative("sign_weight_decay", sign_weight_decay)
+        self._validate_nonnegative("adamw_weight_decay", adamw_weight_decay)
 
         self.partition = partition
         self.last_n_layers = last_n_layers
         self.nonfinite_skipped_steps = 0
 
         param_groups: list[dict[str, object]] = []
-        if self.partition.trunk_layers:
+        if self.partition.sign_layers:
             param_groups.append(
                 {
-                    "params": list(self.partition.trunk_parameters),
-                    "stac_role": "trunk",
-                    "layer_names": self.partition.trunk_layer_names,
-                    "param_names": self.partition.trunk_parameter_names,
-                    "lr": trunk_lr,
-                    "weight_decay": trunk_weight_decay,
-                    "trunk_momentum": trunk_momentum,
-                    "trunk_state_dtype": resolved_trunk_state_dtype,
+                    "params": list(self.partition.sign_parameters),
+                    "stac_role": "sign",
+                    "layer_names": self.partition.sign_layer_names,
+                    "param_names": self.partition.sign_parameter_names,
+                    "lr": default_sign_lr,
+                    "weight_decay": sign_weight_decay,
+                    "sign_momentum": sign_momentum,
+                    "sign_state_dtype": resolved_sign_state_dtype,
                 }
             )
-        if self.partition.cap_layers:
+        if self.partition.adamw_layers:
             param_groups.append(
                 {
-                    "params": list(self.partition.cap_parameters),
-                    "stac_role": "cap",
-                    "layer_names": self.partition.cap_layer_names,
-                    "param_names": self.partition.cap_parameter_names,
-                    "lr": cap_lr,
-                    "weight_decay": cap_weight_decay,
+                    "params": list(self.partition.adamw_parameters),
+                    "stac_role": "adamw",
+                    "layer_names": self.partition.adamw_layer_names,
+                    "param_names": self.partition.adamw_parameter_names,
+                    "lr": lr,
+                    "weight_decay": adamw_weight_decay,
                 }
             )
 
         defaults = {
             "lr": lr,
-            "trunk_lr": trunk_lr,
-            "cap_lr": cap_lr,
-            "trunk_momentum": trunk_momentum,
-            "trunk_state_dtype": resolved_trunk_state_dtype,
+            "sign_momentum": sign_momentum,
+            "sign_state_dtype": resolved_sign_state_dtype,
             "betas": betas,
             "eps": eps,
             "weight_decay": weight_decay,
-            "trunk_weight_decay": trunk_weight_decay,
-            "cap_weight_decay": cap_weight_decay,
+            "sign_weight_decay": sign_weight_decay,
+            "adamw_weight_decay": adamw_weight_decay,
             "amsgrad": amsgrad,
             "maximize": maximize,
             "error_if_nonfinite": error_if_nonfinite,
@@ -338,7 +331,7 @@ class STAC(Optimizer):
             raise ValueError(f"Invalid {name}: {value}.")
 
     @staticmethod
-    def _resolve_trunk_state_dtype(
+    def _resolve_sign_state_dtype(
         value: torch.dtype | str | None,
     ) -> torch.dtype | None:
         if value is None:
@@ -347,23 +340,23 @@ class STAC(Optimizer):
             normalized_value = value.strip().lower()
             if normalized_value in {"parameter", "match_parameter"}:
                 return None
-            resolved_value = _TRUNK_STATE_DTYPE_ALIASES.get(normalized_value)
+            resolved_value = _SIGN_STATE_DTYPE_ALIASES.get(normalized_value)
             if resolved_value is None:
                 raise ValueError(
-                    "trunk_state_dtype must be a floating torch.dtype, None, "
+                    "sign_state_dtype must be a floating torch.dtype, None, "
                     "or one of: "
-                    f"{', '.join(sorted(_TRUNK_STATE_DTYPE_ALIASES))}."
+                    f"{', '.join(sorted(_SIGN_STATE_DTYPE_ALIASES))}."
                 )
             value = resolved_value
 
         if not isinstance(value, torch.dtype):
             raise ValueError(
-                "trunk_state_dtype must be a floating torch.dtype, None, or "
+                "sign_state_dtype must be a floating torch.dtype, None, or "
                 "a supported string alias."
             )
         if not torch.empty((), dtype=value).is_floating_point():
             raise ValueError(
-                "trunk_state_dtype must be a floating-point dtype."
+                "sign_state_dtype must be a floating-point dtype."
             )
         return value
 
@@ -374,7 +367,7 @@ class STAC(Optimizer):
 
         raise RuntimeError(
             "STAC does not support add_param_group(); construct a new optimizer "
-            "so the trunk/cap partition stays deterministic."
+            "so the sign/AdamW partition stays deterministic."
         )
 
     def __setstate__(self, state: dict[str, object]) -> None:
@@ -383,11 +376,11 @@ class STAC(Optimizer):
             self.nonfinite_skipped_steps = 0
         for group in self.param_groups:
             group.setdefault("maximize", False)
-            group.setdefault("stac_role", "trunk")
+            group.setdefault("stac_role", "sign")
             group.setdefault("layer_names", ())
             group.setdefault("param_names", ())
-            group.setdefault("trunk_momentum", 0.0)
-            group.setdefault("trunk_state_dtype", None)
+            group.setdefault("sign_momentum", 0.0)
+            group.setdefault("sign_state_dtype", None)
             group.setdefault("betas", (0.9, 0.999))
             group.setdefault("eps", 1e-8)
             group.setdefault("amsgrad", False)
@@ -397,7 +390,7 @@ class STAC(Optimizer):
         """Load optimizer state while preserving the current STAC partition.
 
         STAC derives its parameter groups from model structure, so loading a
-        state dict whose saved trunk/cap split does not match the current
+        state dict whose saved sign/AdamW split does not match the current
         optimizer is almost always a user error. This override validates the
         partition before delegating to :meth:`torch.optim.Optimizer.load_state_dict`.
         """
@@ -418,22 +411,22 @@ class STAC(Optimizer):
 
         for group in self.param_groups:
             role = group["stac_role"]
-            if role == "trunk":
-                self._step_signsgd(group)
+            if role == "sign":
+                self._step_sign(group)
                 continue
-            if role == "cap":
+            if role == "adamw":
                 self._step_adamw(group)
                 continue
             raise RuntimeError(f"Unexpected STAC parameter group role: {role!r}.")
 
         return loss
 
-    def _step_signsgd(self, group: dict[str, object]) -> None:
+    def _step_sign(self, group: dict[str, object]) -> None:
         lr = float(group["lr"])
         weight_decay = float(group["weight_decay"])
         maximize = bool(group["maximize"])
-        trunk_momentum = float(group["trunk_momentum"])
-        trunk_state_dtype = group["trunk_state_dtype"]
+        sign_momentum = float(group["sign_momentum"])
+        sign_state_dtype = group["sign_state_dtype"]
         parameters: list[torch.Tensor] = []
         updates: list[torch.Tensor] = []
         momentum_buffers: list[torch.Tensor] = []
@@ -448,16 +441,16 @@ class STAC(Optimizer):
             update = -gradient if maximize else gradient
             parameters.append(parameter)
             updates.append(update)
-            if trunk_momentum != 0.0:
+            if sign_momentum != 0.0:
                 state = self.state[parameter]
-                momentum_buffer = state.get("trunk_momentum_buffer")
+                momentum_buffer = state.get("sign_momentum_buffer")
                 buffer_dtype = (
                     parameter.dtype
-                    if trunk_state_dtype is None
-                    else trunk_state_dtype
+                    if sign_state_dtype is None
+                    else sign_state_dtype
                 )
                 if momentum_buffer is None:
-                    momentum_buffer = state["trunk_momentum_buffer"] = torch.zeros_like(
+                    momentum_buffer = state["sign_momentum_buffer"] = torch.zeros_like(
                         parameter,
                         dtype=buffer_dtype,
                         memory_format=torch.preserve_format,
@@ -471,7 +464,7 @@ class STAC(Optimizer):
             if weight_decay != 0:
                 torch._foreach_mul_(parameters, 1 - lr * weight_decay)
 
-            if trunk_momentum != 0.0:
+            if sign_momentum != 0.0:
                 buffer_updates = [
                     update.to(dtype=momentum_buffer.dtype)
                     if update.dtype != momentum_buffer.dtype
@@ -482,11 +475,11 @@ class STAC(Optimizer):
                         strict=True,
                     )
                 ]
-                torch._foreach_mul_(momentum_buffers, trunk_momentum)
+                torch._foreach_mul_(momentum_buffers, sign_momentum)
                 torch._foreach_add_(
                     momentum_buffers,
                     buffer_updates,
-                    alpha=1 - trunk_momentum,
+                    alpha=1 - sign_momentum,
                 )
                 directions = torch._foreach_sign(momentum_buffers)
             else:
@@ -509,16 +502,16 @@ class STAC(Optimizer):
             if weight_decay != 0:
                 parameter.mul_(1 - lr * weight_decay)
 
-            if trunk_momentum != 0.0:
+            if sign_momentum != 0.0:
                 momentum_buffer = momentum_buffers[index]
                 buffer_update = (
                     updates[index].to(dtype=momentum_buffer.dtype)
                     if updates[index].dtype != momentum_buffer.dtype
                     else updates[index]
                 )
-                momentum_buffer.mul_(trunk_momentum).add_(
+                momentum_buffer.mul_(sign_momentum).add_(
                     buffer_update,
-                    alpha=1 - trunk_momentum,
+                    alpha=1 - sign_momentum,
                 )
                 direction = momentum_buffer.sign()
             else:
@@ -547,7 +540,7 @@ class STAC(Optimizer):
             if gradient is None:
                 continue
             if gradient.is_sparse:
-                raise RuntimeError("AdamW cap does not support sparse gradients.")
+                raise RuntimeError("AdamW section does not support sparse gradients.")
 
             update = -gradient if maximize else gradient
             state = self.state[parameter]
@@ -629,7 +622,7 @@ class STAC(Optimizer):
             current_role = current_group["stac_role"]
             if saved_role != current_role:
                 raise ValueError(
-                    "Saved STAC state does not match the current trunk/cap split: "
+                    "Saved STAC state does not match the current sign/AdamW split: "
                     f"group {index} expects role {saved_role!r}, but the current "
                     f"optimizer uses {current_role!r}."
                 )
@@ -726,7 +719,7 @@ class STAC(Optimizer):
     ) -> None:
         expected_shape = tuple(current_parameter.shape)
         for state_key in (
-            "trunk_momentum_buffer",
+            "sign_momentum_buffer",
             "exp_avg",
             "exp_avg_sq",
             "max_exp_avg_sq",

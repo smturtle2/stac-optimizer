@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stac-optimizer"
 dynamic = ["version"]
-description = "STAC optimizer with a signSGD trunk and an AdamW cap for the last N trainable layers."
+description = "STAC optimizer with sign-based early-layer updates and AdamW on the last N trainable layers."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = ["torch>=2.10"]

@@ -23,20 +23,20 @@ class BenchmarkConfig:
     optimizer_kind: str
     lr: float = 3e-3
     last_n_layers: int = 1
-    trunk_momentum: float = 0.9
+    sign_momentum: float = 0.9
     weight_decay: float = 1e-2
 
 
 class ToyMLP(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.trunk_0 = nn.Linear(16, 32)
-        self.trunk_1 = nn.Linear(32, 32)
+        self.block_0 = nn.Linear(16, 32)
+        self.block_1 = nn.Linear(32, 32)
         self.head = nn.Linear(32, 4)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        inputs = torch.relu(self.trunk_0(inputs))
-        inputs = torch.relu(self.trunk_1(inputs))
+        inputs = torch.relu(self.block_0(inputs))
+        inputs = torch.relu(self.block_1(inputs))
         return self.head(inputs)
 
 
@@ -111,7 +111,7 @@ def build_optimizer(
             model,
             lr=config.lr,
             last_n_layers=config.last_n_layers,
-            trunk_momentum=config.trunk_momentum,
+            sign_momentum=config.sign_momentum,
             weight_decay=config.weight_decay,
         )
     if config.optimizer_kind == "adamw":
@@ -272,16 +272,16 @@ def main() -> None:
 
     configs = [
         BenchmarkConfig(
-            label="STAC default (cap=1)",
+            label="STAC default (last_n_layers=1)",
             optimizer_kind="stac",
         ),
         BenchmarkConfig(
-            label="STAC plain sign trunk",
+            label="STAC plain sign update",
             optimizer_kind="stac",
-            trunk_momentum=0.0,
+            sign_momentum=0.0,
         ),
         BenchmarkConfig(
-            label="STAC wider cap (cap=2)",
+            label="STAC wider AdamW section (last_n_layers=2)",
             optimizer_kind="stac",
             last_n_layers=2,
         ),
