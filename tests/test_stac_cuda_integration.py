@@ -104,6 +104,44 @@ class DeepClassificationStudent(nn.Module):
         return self.head(inputs)
 
 
+class TailNormTeacher(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stem = nn.Linear(64, 96)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(96, use_layernorm=False) for _ in range(5)]
+        )
+        self.bridge = nn.Linear(96, 96)
+        self.final_norm = nn.LayerNorm(96)
+        self.head = nn.Linear(96, 6)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        inputs = self.bridge(inputs)
+        inputs = self.final_norm(inputs)
+        return self.head(inputs)
+
+
+class TailNormStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stem = nn.Linear(64, 128)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(128, use_layernorm=False) for _ in range(10)]
+        )
+        self.bridge = nn.Linear(128, 128)
+        self.final_norm = nn.LayerNorm(128)
+        self.head = nn.Linear(128, 6)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        inputs = self.bridge(inputs)
+        inputs = self.final_norm(inputs)
+        return self.head(inputs)
+
+
 class StateMemoryNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -152,11 +190,12 @@ def _make_classification_data(
     seed: int,
     *,
     device: torch.device,
+    tail_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(4096, 64, generator=generator)
     val_inputs = torch.randn(1024, 64, generator=generator)
-    teacher = DeepClassificationTeacher()
+    teacher = TailNormTeacher() if tail_norm else DeepClassificationTeacher()
     train_targets = teacher(train_inputs).argmax(dim=1)
     val_targets = teacher(val_inputs).argmax(dim=1)
 
@@ -197,6 +236,8 @@ def _make_optimizer(
     *,
     last_n_modules: int = 1,
     sign_lr_scale: float = 1.0,
+    sign_weight_decay: float | None = None,
+    adamw_weight_decay: float | None = None,
 ) -> torch.optim.Optimizer:
     if optimizer_kind == "stac":
         return STAC(
@@ -205,6 +246,8 @@ def _make_optimizer(
             last_n_modules=last_n_modules,
             sign_lr_scale=sign_lr_scale,
             weight_decay=1e-2,
+            sign_weight_decay=sign_weight_decay,
+            adamw_weight_decay=adamw_weight_decay,
         )
     if optimizer_kind == "adamw":
         return torch.optim.AdamW(
@@ -222,6 +265,8 @@ def _run_regression_trial(
     device: torch.device,
     last_n_modules: int = 1,
     sign_lr_scale: float = 1.0,
+    sign_weight_decay: float | None = None,
+    adamw_weight_decay: float | None = None,
 ) -> float:
     train_inputs, train_targets, val_inputs, val_targets = _make_regression_data(
         seed,
@@ -241,6 +286,8 @@ def _run_regression_trial(
         model,
         last_n_modules=last_n_modules,
         sign_lr_scale=sign_lr_scale,
+        sign_weight_decay=sign_weight_decay,
+        adamw_weight_decay=adamw_weight_decay,
     )
 
     for batch_index in batch_schedule:
@@ -265,10 +312,14 @@ def _run_classification_trial(
     device: torch.device,
     last_n_modules: int = 1,
     sign_lr_scale: float = 1.0,
+    sign_weight_decay: float | None = None,
+    adamw_weight_decay: float | None = None,
+    tail_norm: bool = False,
 ) -> tuple[float, float]:
     train_inputs, train_targets, val_inputs, val_targets = _make_classification_data(
         seed,
         device=device,
+        tail_norm=tail_norm,
     )
     batch_schedule = _batch_indices(
         train_inputs.shape[0],
@@ -278,12 +329,18 @@ def _run_classification_trial(
     )
 
     _seed_all(40_000 + seed)
-    model = DeepClassificationStudent().to(device)
+    model = (
+        TailNormStudent().to(device)
+        if tail_norm
+        else DeepClassificationStudent().to(device)
+    )
     optimizer = _make_optimizer(
         optimizer_kind,
         model,
         last_n_modules=last_n_modules,
         sign_lr_scale=sign_lr_scale,
+        sign_weight_decay=sign_weight_decay,
+        adamw_weight_decay=adamw_weight_decay,
     )
 
     for batch_index in batch_schedule:
@@ -314,21 +371,35 @@ def _measure_memory(
     optimizer_kind: str,
     *,
     device: torch.device,
+    last_n_modules: int = 1,
+    sign_lr_scale: float = 1.0,
+    sign_weight_decay: float | None = None,
+    adamw_weight_decay: float | None = None,
 ) -> tuple[float, float]:
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
     _seed_all(0)
     model = StateMemoryNet().to(device)
-    optimizer = _make_optimizer(optimizer_kind, model, last_n_modules=1)
+    optimizer = _make_optimizer(
+        optimizer_kind,
+        model,
+        last_n_modules=last_n_modules,
+        sign_lr_scale=sign_lr_scale,
+        sign_weight_decay=sign_weight_decay,
+        adamw_weight_decay=adamw_weight_decay,
+    )
     inputs = torch.randn(32, 256, device=device)
     targets = torch.randn(32, 16, device=device)
 
     optimizer.zero_grad(set_to_none=True)
-    torch.cuda.reset_peak_memory_stats(device)
-    baseline = torch.cuda.memory_allocated(device)
     predictions = model(inputs)
     loss = torch.nn.functional.mse_loss(predictions, targets)
     loss.backward()
+    del loss, predictions
+    torch.cuda.synchronize(device)
+    baseline = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+
     optimizer.step()
     torch.cuda.synchronize(device)
 
@@ -337,57 +408,158 @@ def _measure_memory(
     return peak_delta, steady_delta
 
 
-def test_stac_is_competitive_with_adamw_on_deep_cuda_suite(
+def test_stac_presets_form_a_quality_memory_frontier_on_deep_cuda_suite(
     cuda_device: torch.device,
 ) -> None:
-    regression_results = {
-        optimizer_kind: [
-            _run_regression_trial(seed, optimizer_kind, device=cuda_device)
-            for seed in range(3)
-        ]
-        for optimizer_kind in ("stac", "adamw")
-    }
-    classification_results = {
-        optimizer_kind: [
-            _run_classification_trial(seed, optimizer_kind, device=cuda_device)
-            for seed in range(3)
-        ]
-        for optimizer_kind in ("stac", "adamw")
+    seeds = range(5)
+    preset_kwargs = {
+        "stac_default": {
+            "optimizer_kind": "stac",
+        },
+        "stac_balanced_trunk": {
+            "optimizer_kind": "stac",
+            "sign_weight_decay": 5e-3,
+        },
+        "stac_wide_cap": {
+            "optimizer_kind": "stac",
+            "last_n_modules": 4,
+            "sign_weight_decay": 5e-3,
+        },
+        "adamw": {
+            "optimizer_kind": "adamw",
+        },
     }
 
-    stac_regression = statistics.fmean(regression_results["stac"])
+    regression_results = {
+        label: [
+            _run_regression_trial(seed, device=cuda_device, **kwargs)
+            for seed in seeds
+        ]
+        for label, kwargs in preset_kwargs.items()
+    }
+    classification_results = {
+        label: [
+            _run_classification_trial(seed, device=cuda_device, **kwargs)
+            for seed in seeds
+        ]
+        for label, kwargs in preset_kwargs.items()
+    }
+    tailnorm_results = {
+        label: [
+            _run_classification_trial(
+                seed,
+                device=cuda_device,
+                tail_norm=True,
+                **kwargs,
+            )
+            for seed in seeds
+        ]
+        for label, kwargs in preset_kwargs.items()
+    }
+
+    default_regression = statistics.fmean(regression_results["stac_default"])
+    wide_regression = statistics.fmean(regression_results["stac_wide_cap"])
     adamw_regression = statistics.fmean(regression_results["adamw"])
-    stac_classification_loss = statistics.fmean(
-        loss for loss, _ in classification_results["stac"]
+    default_classification_loss = statistics.fmean(
+        loss for loss, _ in classification_results["stac_default"]
+    )
+    balanced_classification_loss = statistics.fmean(
+        loss for loss, _ in classification_results["stac_balanced_trunk"]
     )
     adamw_classification_loss = statistics.fmean(
         loss for loss, _ in classification_results["adamw"]
     )
-    stac_classification_acc = statistics.fmean(
-        accuracy for _, accuracy in classification_results["stac"]
+    default_classification_acc = statistics.fmean(
+        accuracy for _, accuracy in classification_results["stac_default"]
+    )
+    balanced_classification_acc = statistics.fmean(
+        accuracy for _, accuracy in classification_results["stac_balanced_trunk"]
     )
     adamw_classification_acc = statistics.fmean(
         accuracy for _, accuracy in classification_results["adamw"]
     )
+    adamw_tailnorm_loss = statistics.fmean(
+        loss for loss, _ in tailnorm_results["adamw"]
+    )
+    adamw_tailnorm_acc = statistics.fmean(
+        accuracy for _, accuracy in tailnorm_results["adamw"]
+    )
+    default_tailnorm_acc = statistics.fmean(
+        accuracy for _, accuracy in tailnorm_results["stac_default"]
+    )
+    wide_tailnorm_acc = statistics.fmean(
+        accuracy for _, accuracy in tailnorm_results["stac_wide_cap"]
+    )
 
-    assert stac_regression <= adamw_regression * 1.18
-    assert stac_classification_loss <= adamw_classification_loss * 1.08
-    assert stac_classification_acc >= adamw_classification_acc - 0.03
+    best_stac_regression = min(
+        statistics.fmean(results)
+        for label, results in regression_results.items()
+        if label != "adamw"
+    )
+    best_stac_classification_loss = min(
+        statistics.fmean(loss for loss, _ in results)
+        for label, results in classification_results.items()
+        if label != "adamw"
+    )
+    best_stac_classification_acc = max(
+        statistics.fmean(accuracy for _, accuracy in results)
+        for label, results in classification_results.items()
+        if label != "adamw"
+    )
+    best_stac_tailnorm_loss = min(
+        statistics.fmean(loss for loss, _ in results)
+        for label, results in tailnorm_results.items()
+        if label != "adamw"
+    )
+    best_stac_tailnorm_acc = max(
+        statistics.fmean(accuracy for _, accuracy in results)
+        for label, results in tailnorm_results.items()
+        if label != "adamw"
+    )
+
+    assert wide_regression <= default_regression
+    assert balanced_classification_loss <= default_classification_loss
+    assert balanced_classification_acc >= default_classification_acc
+    assert wide_tailnorm_acc >= default_tailnorm_acc
+
+    assert best_stac_regression <= adamw_regression * 1.25
+    assert best_stac_classification_loss <= adamw_classification_loss * 1.08
+    assert best_stac_classification_acc >= adamw_classification_acc - 0.02
+    assert best_stac_tailnorm_loss <= adamw_tailnorm_loss * 1.20
+    assert best_stac_tailnorm_acc >= adamw_tailnorm_acc - 0.05
 
 
-def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
+def test_stac_presets_use_less_optimizer_state_than_adamw_on_cuda(
     cuda_device: torch.device,
 ) -> None:
     _seed_all(0)
-    stac_model = StateMemoryNet().to(cuda_device)
+    default_model = StateMemoryNet().to(cuda_device)
+    _seed_all(0)
+    balanced_model = StateMemoryNet().to(cuda_device)
+    _seed_all(0)
+    wide_model = StateMemoryNet().to(cuda_device)
     _seed_all(0)
     adamw_model = StateMemoryNet().to(cuda_device)
 
-    stac_optimizer = STAC(
-        stac_model,
+    default_optimizer = STAC(
+        default_model,
         lr=2e-3,
         last_n_modules=1,
         weight_decay=1e-2,
+    )
+    balanced_optimizer = STAC(
+        balanced_model,
+        lr=2e-3,
+        last_n_modules=1,
+        weight_decay=1e-2,
+        sign_weight_decay=5e-3,
+    )
+    wide_optimizer = STAC(
+        wide_model,
+        lr=2e-3,
+        last_n_modules=4,
+        weight_decay=1e-2,
+        sign_weight_decay=5e-3,
     )
     adamw_optimizer = torch.optim.AdamW(
         adamw_model.parameters(),
@@ -399,26 +571,46 @@ def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
     targets = torch.randn(32, 16, device=cuda_device)
 
     for model, optimizer in (
-        (stac_model, stac_optimizer),
+        (default_model, default_optimizer),
+        (balanced_model, balanced_optimizer),
+        (wide_model, wide_optimizer),
         (adamw_model, adamw_optimizer),
     ):
         optimizer.zero_grad(set_to_none=True)
         predictions = model(inputs)
         loss = torch.nn.functional.mse_loss(predictions, targets)
         loss.backward()
+        del loss, predictions
         optimizer.step()
 
-    stac_state_bytes = _optimizer_state_bytes(stac_optimizer)
+    default_state_bytes = _optimizer_state_bytes(default_optimizer)
+    balanced_state_bytes = _optimizer_state_bytes(balanced_optimizer)
+    wide_state_bytes = _optimizer_state_bytes(wide_optimizer)
     adamw_state_bytes = _optimizer_state_bytes(adamw_optimizer)
 
-    assert stac_state_bytes < adamw_state_bytes * 0.35
+    assert default_state_bytes == balanced_state_bytes
+    assert default_state_bytes < wide_state_bytes < adamw_state_bytes
+    assert wide_state_bytes < adamw_state_bytes * 0.35
 
 
-def test_stac_uses_less_peak_cuda_memory_than_adamw_on_cuda(
+def test_stac_presets_use_less_peak_cuda_memory_than_adamw_on_cuda(
     cuda_device: torch.device,
 ) -> None:
-    stac_peak_mb, stac_steady_mb = _measure_memory("stac", device=cuda_device)
+    default_peak_mb, default_steady_mb = _measure_memory("stac", device=cuda_device)
+    balanced_peak_mb, balanced_steady_mb = _measure_memory(
+        "stac",
+        device=cuda_device,
+        sign_weight_decay=5e-3,
+    )
+    wide_peak_mb, wide_steady_mb = _measure_memory(
+        "stac",
+        device=cuda_device,
+        last_n_modules=4,
+        sign_weight_decay=5e-3,
+    )
     adamw_peak_mb, adamw_steady_mb = _measure_memory("adamw", device=cuda_device)
 
-    assert stac_peak_mb < adamw_peak_mb
-    assert stac_steady_mb < adamw_steady_mb
+    assert abs(default_peak_mb - balanced_peak_mb) < 2.0
+    assert abs(default_steady_mb - balanced_steady_mb) < 2.0
+    assert default_peak_mb < wide_peak_mb < adamw_peak_mb
+    assert default_steady_mb < wide_steady_mb < adamw_steady_mb

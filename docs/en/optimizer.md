@@ -4,26 +4,37 @@
 [Korean docs](../ko/optimizer.md) |
 [Benchmark JSON](../benchmark/research_benchmark.json)
 
-STAC means "SignSGD Trunk, AdamW Cap". It keeps the final `N` trainable
-modules on AdamW and the earlier trainable modules on plain signSGD. The sign
-trunk is intentionally momentum-free and sign-state-free.
+STAC means "SignSGD Trunk, AdamW Cap". The final `N` trainable modules stay on
+AdamW and the earlier trainable modules use plain signSGD. The sign trunk is
+deliberately state-free: no momentum, no EMA, and no sign-side optimizer
+tensors.
 
 ```mermaid
 flowchart LR
-    A["model.named_modules order"]
-    A --> B["direct trainable modules only"]
-    B --> C["earlier modules"]
-    B --> D["last N modules"]
-    C --> E["sign trunk<br/>decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>no momentum<br/>no sign-side state"]
-    D --> F["AdamW cap<br/>decoupled weight decay<br/>exp_avg + exp_avg_sq"]
+    A["Trainable modules<br/>registration order"]
+
+    subgraph S["Sign trunk"]
+        B["Earlier modules"]
+        C["Decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>no momentum<br/>no sign-side state"]
+    end
+
+    subgraph T["AdamW cap"]
+        D["Last N modules"]
+        E["Standard AdamW<br/>exp_avg + exp_avg_sq"]
+    end
+
+    A --> B
+    A --> D
+    B --> C
+    D --> E
 
     classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
     classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
     classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
 
-    class A,B neutral;
-    class C,E sign;
-    class D,F adam;
+    class A neutral;
+    class B,C sign;
+    class D,E adam;
 ```
 
 ## Update Rules
@@ -37,44 +48,38 @@ STAC counts only modules that directly own trainable parameters
 (`named_parameters(recurse=False)`). Pure containers such as `nn.Sequential`
 are skipped unless they own parameters themselves.
 
-When both sections are active, STAC uses `sign_lr_scale * lr` for the sign
-trunk and `lr` for the AdamW cap. The default `sign_lr_scale=1.0` keeps the
-public learning rate interpretation simple, but lowering it is often useful
-when the sign trunk is too aggressive for a workload.
+## Why This Split Exists
 
-## Why This Design
+The research picture is mixed:
 
-Research constraints pull in two directions:
-
-- The original signSGD paper introduced sign-only updates and reported that a
-  momentum counterpart could match Adam on large image models. STAC does not
-  use that momentum path because this library is explicitly scoped to plain
-  signSGD in the trunk.
+- The original signSGD paper introduced sign-only updates and reported strong
+  large-scale results.
 - The error-feedback paper showed that plain signSGD can fail to converge or
-  generalize poorly in some settings. That is a real limitation, not something
-  to hide.
+  generalize poorly in some settings.
 - The ICLR 2025 optimizer study found that adaptivity on the last layer and
   LayerNorm parameters matters disproportionately for performance and learning
   rate stability.
 
-STAC is the practical compromise derived from those sources and from this
-repository's CUDA benchmarks: keep the trunk on textbook signSGD, but preserve
-AdamW where adaptivity is most likely to matter. The claim that widening the
-AdamW cap helps normalization-heavy tails is an inference from the cited paper
-and from the benchmark results in this repository.
+STAC is the constrained compromise for that evidence: keep the trunk on plain
+signSGD to avoid sign-side state, but preserve AdamW on the tail where
+adaptivity matters most.
 
-## Stability Notes
+## Stability Playbook
 
-| Knob | Default | When to change it |
+| Knob | Default | Practical use |
 | --- | --- | --- |
-| `last_n_modules` | `1` | Increase it when the final normalization and head both need adaptivity |
-| `sign_lr_scale` | `1.0` | Lower it when the sign trunk is too noisy or overshoots |
-| `foreach` | `False` | Enable only when step throughput matters more than peak memory |
-| `error_if_nonfinite` | `False` | Turn on when you want immediate failure on `NaN` or `Inf` gradients |
+| `last_n_modules` | `1` | Increase it when the adaptive tail is too small for the workload |
+| `sign_weight_decay` | inherits `weight_decay` | First tuning step for classification-heavy workloads; `0.5 * weight_decay` worked well in this repository benchmark |
+| `sign_lr_scale` | `1.0` | Lower it when the sign trunk is too aggressive or noisy |
+| `foreach` | `False` | Turn on only when step throughput matters more than peak memory |
+| `error_if_nonfinite` | `False` | Turn on when `NaN` or `Inf` gradients should fail immediately |
+
+The `sign_weight_decay = 0.5 * weight_decay` recommendation above is an
+inference from this repository's benchmark, not a universal rule.
 
 `foreach=False` is deliberate. PyTorch's AdamW docs note that the foreach path
-typically runs faster on CUDA, but it also uses roughly `sizeof(params)` more
-peak memory because intermediates are materialized as tensor lists.
+is often faster on CUDA, but it also uses about `sizeof(params)` more peak
+memory because the intermediates are materialized as tensor lists.
 
 ## Public API
 
@@ -88,8 +93,8 @@ peak memory because intermediates are materialized as tensor lists.
 Runtime guarantees that matter in practice:
 
 - deterministic partitioning from `model.named_modules()`
-- explicit sparse-gradient rejection
 - no sign-side optimizer state in the sign trunk
+- explicit sparse-gradient rejection
 - whole-step skip on non-finite dense gradients unless `error_if_nonfinite=True`
 - state-dict validation for roles, module names, parameter names, and tensor shapes
 - AdamW step counters kept on CPU in non-capturable mode to avoid unnecessary CUDA state
@@ -105,26 +110,31 @@ Primary assets:
 Snapshot from `2026-03-19` on `torch 2.10.0+cu126` and
 `NVIDIA GeForce RTX 3070`:
 
-| Config | Deep regression val loss | Deep classification val acc | TailNorm val acc | Optimizer state MB | Peak delta MB |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `STAC` default (`last_n_modules=1`) | `0.016337` | `0.7037` | `0.7926` | `0.125` | `56.118` |
-| `STAC` wider AdamW cap (`last_n_modules=4`) | `0.015252` | `0.7092` | `0.8041` | `24.149` | `81.271` |
-| `AdamW` baseline | `0.013477` | `0.7207` | `0.8051` | `98.227` | `196.459` |
+| Config | Setup | Deep regression val loss | Deep classification val acc | TailNorm val acc | Optimizer state MB | Peak step delta MB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `STAC default` | `last_n_modules=1` | `0.016294` | `0.7037` | `0.7926` | `0.125` | `7.001` |
+| `STAC balanced trunk` | `last_n_modules=1`, `sign_weight_decay=0.5 * weight_decay` | `0.016114` | `0.7219` | `0.8027` | `0.125` | `7.001` |
+| `STAC wider cap` | `last_n_modules=4`, `sign_weight_decay=0.5 * weight_decay` | `0.015287` | `0.7262` | `0.8029` | `24.149` | `32.153` |
+| `AdamW baseline` | full AdamW | `0.013477` | `0.7207` | `0.8051` | `98.227` | `147.341` |
 
 Methodology used by the repository benchmark:
 
 - CUDA only
 - held-out validation splits
 - `5` paired seeds
-- deep residual models instead of shallow MLPs
+- deep residual models instead of shallow toy MLPs
 - epoch-by-epoch validation loss curves
-- optimizer-state and peak CUDA memory probe on the first optimization step
+- optimizer-state and peak step-memory probe on the first optimization step
+
+Repository takeaway: the balanced trunk recovered most of the classification gap
+at the same optimizer-state cost as the default split, while the wider cap
+traded more AdamW state for better regression and tail quality. That is an
+inference from this repository's benchmark, not a universal claim.
 
 ## References
 
 - [signSGD: Compressed Optimisation for Non-Convex Problems](https://arxiv.org/abs/1802.04434)
 - [Error Feedback Fixes SignSGD and other Gradient Compression Schemes](https://proceedings.mlr.press/v97/karimireddy19a.html)
-- [Momentum Ensures Convergence of SIGNSGD under Weaker Assumptions](https://proceedings.mlr.press/v202/sun23l.html)
 - [Decoupled Weight Decay Regularization](https://arxiv.org/abs/1711.05101)
 - [Deconstructing What Makes a Good Optimizer for Autoregressive Language Models](https://openreview.net/forum?id=zfeso8ceqr)
 - [PyTorch AdamW documentation](https://docs.pytorch.org/docs/stable/generated/torch.optim.AdamW.html)

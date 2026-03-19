@@ -636,6 +636,21 @@ def test_load_state_dict_rejects_partition_mismatch(
         mismatched_optimizer.load_state_dict(stateful_optimizer.state_dict())
 
 
+def test_load_state_dict_rejects_non_stac_optimizer_state(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    stac_optimizer = STAC(model, lr=0.1, last_n_modules=0)
+    foreign_optimizer = torch.optim.AdamW(model.parameters(), lr=0.1)
+
+    model.base.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    foreign_optimizer.step()
+
+    with pytest.raises(ValueError, match="not a STAC state dict"):
+        stac_optimizer.load_state_dict(deepcopy(foreign_optimizer.state_dict()))
+
+
 def test_load_state_dict_rejects_parameter_shape_mismatch() -> None:
     source_model = TwoLayerNet()
     source_optimizer = STAC(source_model, lr=0.1, last_n_modules=1)
@@ -675,6 +690,24 @@ def test_load_state_dict_drops_legacy_sign_buffer(cuda_device: torch.device) -> 
     optimizer.load_state_dict(state_dict)
 
     assert model.base.weight not in optimizer.state
+
+
+def test_load_state_dict_rejects_unexpected_sign_state(
+    cuda_device: torch.device,
+) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
+    state_dict = deepcopy(optimizer.state_dict())
+    sign_group = state_dict["param_groups"][0]
+    sign_param_id = sign_group["params"][0]
+    state_dict["state"][sign_param_id] = {
+        "step": torch.tensor(1.0),
+        "exp_avg": torch.zeros((1, 1), device=cuda_device),
+        "exp_avg_sq": torch.zeros((1, 1), device=cuda_device),
+    }
+
+    with pytest.raises(ValueError, match="must not carry optimizer state"):
+        optimizer.load_state_dict(state_dict)
 
 
 def test_adamw_step_counter_stays_on_cpu(cuda_device: torch.device) -> None:

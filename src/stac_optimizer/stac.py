@@ -10,6 +10,7 @@ from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
 _DEFAULT_SIGN_LR_SCALE = 1.0
+_LEGACY_SIGN_STATE_KEYS = frozenset({"sign_momentum_buffer"})
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,15 @@ class STACPartition:
             for module in self.adamw_modules
             for parameter in module.parameters
         )
+
+
+@dataclass(frozen=True)
+class _PreparedGroup:
+    """Dense gradients collected for one STAC param group."""
+
+    group: dict[str, object]
+    parameters: tuple[nn.Parameter, ...]
+    gradients: tuple[torch.Tensor, ...]
 
 
 def partition_trainable_modules(
@@ -177,6 +187,12 @@ class STAC(Optimizer):
     rate semantics simple while still allowing a more conservative sign step
     when a workload needs it.
 
+    When decoupled weight decay is enabled in hybrid mode, the sign trunk often
+    benefits from a lighter decay than the AdamW cap. The repository CUDA
+    benchmark found ``sign_weight_decay=0.5 * weight_decay`` to be a strong
+    starting point on deep classification-style workloads without adding any
+    sign-side optimizer state.
+
     By default STAC uses single-tensor step logic instead of PyTorch's
     ``foreach`` optimizer path. This keeps peak CUDA memory more conservative.
     Set ``foreach=True`` when step throughput matters more than temporary
@@ -231,6 +247,8 @@ class STAC(Optimizer):
             weight_decay: Shared decoupled weight decay applied to both roles
                 unless overridden.
             sign_weight_decay: Decoupled weight decay for the sign-based section.
+                In hybrid mode, ``0.5 * weight_decay`` is often a better
+                stability starting point than matching the AdamW cap exactly.
             adamw_weight_decay: Decoupled weight decay for the AdamW section.
             amsgrad: Enable the AMSGrad variant for the AdamW section.
             maximize: Maximize the objective instead of minimizing it.
@@ -384,52 +402,110 @@ class STAC(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        if self._skip_step_for_nonfinite_gradients():
-            self.nonfinite_skipped_steps += 1
-            return loss
-
+        prepared_groups: list[_PreparedGroup] = []
         for group in self.param_groups:
-            role = group["stac_role"]
+            prepared_group, should_skip = self._prepare_group(group)
+            if should_skip:
+                self.nonfinite_skipped_steps += 1
+                return loss
+            prepared_groups.append(prepared_group)
+
+        for prepared_group in prepared_groups:
+            role = prepared_group.group["stac_role"]
             if role == "sign":
-                self._step_sign(group)
+                self._step_sign(prepared_group)
                 continue
             if role == "adamw":
-                self._step_adamw(group)
+                self._step_adamw(prepared_group)
                 continue
             raise RuntimeError(f"Unexpected STAC parameter group role: {role!r}.")
 
         return loss
 
-    def _step_sign(self, group: dict[str, object]) -> None:
-        lr = float(group["lr"])
-        weight_decay = float(group["weight_decay"])
+    def _prepare_group(
+        self,
+        group: dict[str, object],
+    ) -> tuple[_PreparedGroup, bool]:
+        role = str(group["stac_role"])
+        error_if_nonfinite = bool(group["error_if_nonfinite"])
         maximize = bool(group["maximize"])
-        parameters: list[torch.Tensor] = []
-        updates: list[torch.Tensor] = []
+        parameters: list[nn.Parameter] = []
+        gradients: list[torch.Tensor] = []
+        found_nonfinite_on_cpu = False
+        found_nonfinite_by_device: dict[torch.device, torch.Tensor] = {}
 
         for parameter in group["params"]:
             gradient = parameter.grad
             if gradient is None:
                 continue
             if gradient.is_sparse:
-                raise RuntimeError("STAC does not support sparse gradients.")
+                if role == "sign":
+                    raise RuntimeError("STAC does not support sparse gradients.")
+                raise RuntimeError("AdamW section does not support sparse gradients.")
 
-            update = -gradient if maximize else gradient
+            is_nonfinite = torch.logical_not(torch.isfinite(gradient).all())
+            if gradient.device.type == "cpu":
+                if bool(is_nonfinite.item()):
+                    found_nonfinite_on_cpu = True
+            else:
+                prior_flag = found_nonfinite_by_device.get(gradient.device)
+                if prior_flag is None:
+                    found_nonfinite_by_device[gradient.device] = is_nonfinite
+                else:
+                    found_nonfinite_by_device[gradient.device] = torch.logical_or(
+                        prior_flag,
+                        is_nonfinite,
+                    )
+
             parameters.append(parameter)
-            updates.append(update)
+            gradients.append(-gradient if maximize else gradient)
 
+        found_nonfinite = found_nonfinite_on_cpu or any(
+            bool(device_flag.item())
+            for device_flag in found_nonfinite_by_device.values()
+        )
+        if found_nonfinite:
+            if error_if_nonfinite:
+                raise RuntimeError(
+                    f"Encountered non-finite gradients in the STAC {role}."
+                )
+            return (
+                _PreparedGroup(
+                    group=group,
+                    parameters=(),
+                    gradients=(),
+                ),
+                True,
+            )
+
+        return (
+            _PreparedGroup(
+                group=group,
+                parameters=tuple(parameters),
+                gradients=tuple(gradients),
+            ),
+            False,
+        )
+
+    def _step_sign(self, prepared_group: _PreparedGroup) -> None:
+        group = prepared_group.group
+        parameters = prepared_group.parameters
+        gradients = prepared_group.gradients
         if not parameters:
             return
 
+        lr = float(group["lr"])
+        weight_decay = float(group["weight_decay"])
+
         use_foreach = bool(group["foreach"]) and self._can_use_foreach(
             parameters,
-            updates,
+            gradients,
         )
         if use_foreach:
             if weight_decay != 0:
                 torch._foreach_mul_(parameters, 1 - lr * weight_decay)
 
-            directions = torch._foreach_sign(updates)
+            directions = torch._foreach_sign(list(gradients))
             directions = [
                 direction.to(dtype=parameter.dtype)
                 if direction.dtype != parameter.dtype
@@ -443,37 +519,33 @@ class STAC(Optimizer):
             torch._foreach_add_(parameters, directions, alpha=-lr)
             return
 
-        for index, parameter in enumerate(parameters):
+        for parameter, gradient in zip(parameters, gradients, strict=True):
             if weight_decay != 0:
                 parameter.mul_(1 - lr * weight_decay)
 
-            direction = updates[index].sign()
+            direction = gradient.sign()
             if direction.dtype != parameter.dtype:
                 direction = direction.to(dtype=parameter.dtype)
             parameter.add_(direction, alpha=-lr)
 
-    def _step_adamw(self, group: dict[str, object]) -> None:
+    def _step_adamw(self, prepared_group: _PreparedGroup) -> None:
+        group = prepared_group.group
+        parameters = prepared_group.parameters
+        gradients = prepared_group.gradients
+        if not parameters:
+            return
+
         lr = float(group["lr"])
         beta1, beta2 = group["betas"]
         eps = float(group["eps"])
         weight_decay = float(group["weight_decay"])
         amsgrad = bool(group["amsgrad"])
-        maximize = bool(group["maximize"])
-        parameters: list[torch.Tensor] = []
-        gradients: list[torch.Tensor] = []
         exp_avgs: list[torch.Tensor] = []
         exp_avg_sqs: list[torch.Tensor] = []
         max_exp_avg_sqs: list[torch.Tensor] = []
         state_steps: list[torch.Tensor] = []
 
-        for parameter in group["params"]:
-            gradient = parameter.grad
-            if gradient is None:
-                continue
-            if gradient.is_sparse:
-                raise RuntimeError("AdamW section does not support sparse gradients.")
-
-            update = -gradient if maximize else gradient
+        for parameter in parameters:
             state = self.state[parameter]
             if not state:
                 state["step"] = torch.tensor(0.0)
@@ -497,16 +569,11 @@ class STAC(Optimizer):
             elif step.device.type != "cpu":
                 step = state["step"] = step.detach().to(device="cpu")
 
-            parameters.append(parameter)
-            gradients.append(update)
             exp_avgs.append(state["exp_avg"])
             exp_avg_sqs.append(state["exp_avg_sq"])
             state_steps.append(step)
             if amsgrad:
                 max_exp_avg_sqs.append(state["max_exp_avg_sq"])
-
-        if not parameters:
-            return
 
         use_foreach = bool(group["foreach"]) and self._can_use_foreach(
             parameters,
@@ -554,8 +621,14 @@ class STAC(Optimizer):
                 raise ValueError(
                     f"Saved STAC param group {index} is malformed: {saved_group!r}."
                 )
+            if "stac_role" not in saved_group:
+                raise ValueError(
+                    "Saved optimizer state is not a STAC state dict. "
+                    "Load a state dict that was produced by the same STAC "
+                    "sign/AdamW partition."
+                )
 
-            saved_role = saved_group.get("stac_role", current_group["stac_role"])
+            saved_role = saved_group["stac_role"]
             current_role = current_group["stac_role"]
             if saved_role != current_role:
                 raise ValueError(
@@ -591,6 +664,12 @@ class STAC(Optimizer):
                     group_index=index,
                     param_index=param_index,
                 )
+                if current_role == "sign":
+                    self._validate_sign_state_keys(
+                        parameter_state,
+                        group_index=index,
+                        param_index=param_index,
+                    )
 
             saved_module_names = tuple(saved_group.get("module_names", ()))
             current_module_names = tuple(current_group.get("module_names", ()))
@@ -609,23 +688,6 @@ class STAC(Optimizer):
                     f"group {index} checkpoint parameters {saved_param_names!r} "
                     f"do not match current parameters {current_param_names!r}."
                 )
-
-    def _skip_step_for_nonfinite_gradients(self) -> bool:
-        for group in self.param_groups:
-            role = str(group["stac_role"])
-            error_if_nonfinite = bool(group["error_if_nonfinite"])
-            for parameter in group["params"]:
-                gradient = parameter.grad
-                if gradient is None or gradient.is_sparse:
-                    continue
-                if torch.isfinite(gradient).all():
-                    continue
-                if error_if_nonfinite:
-                    raise RuntimeError(
-                        f"Encountered non-finite gradients in the STAC {role}."
-                    )
-                return True
-        return False
 
     def _drop_legacy_sign_state(self) -> None:
         for group in self.param_groups:
@@ -683,3 +745,20 @@ class STAC(Optimizer):
                     f"{expected_shape!r}, but saved state {state_key!r} uses "
                     f"{tuple(state_value.shape)!r}."
                 )
+
+    @staticmethod
+    def _validate_sign_state_keys(
+        parameter_state: Mapping[str, Any],
+        *,
+        group_index: int,
+        param_index: int,
+    ) -> None:
+        unexpected_state_keys = tuple(
+            sorted(set(parameter_state) - _LEGACY_SIGN_STATE_KEYS)
+        )
+        if unexpected_state_keys:
+            raise ValueError(
+                "Saved STAC sign section must not carry optimizer state: "
+                f"group {group_index} parameter {param_index} contains "
+                f"{unexpected_state_keys!r}."
+            )

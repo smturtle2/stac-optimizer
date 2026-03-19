@@ -32,6 +32,8 @@ class BenchmarkConfig:
     last_n_modules: int = 1
     sign_lr_scale: float = 1.0
     weight_decay: float = 1e-2
+    sign_weight_decay: float | None = None
+    adamw_weight_decay: float | None = None
     color: str = "#1f77b4"
     linestyle: str | tuple[int, tuple[int, ...]] = "-"
 
@@ -279,6 +281,8 @@ def build_optimizer(
             last_n_modules=config.last_n_modules,
             sign_lr_scale=config.sign_lr_scale,
             weight_decay=config.weight_decay,
+            sign_weight_decay=config.sign_weight_decay,
+            adamw_weight_decay=config.adamw_weight_decay,
         )
     if config.optimizer_kind == "adamw":
         return torch.optim.AdamW(
@@ -535,11 +539,13 @@ def measure_peak_memory(
         targets = torch.randn(batch_size, 16, device=device)
 
         optimizer.zero_grad(set_to_none=True)
-        torch.cuda.reset_peak_memory_stats(device)
-        baseline = torch.cuda.memory_allocated(device)
         predictions = model(inputs)
         loss = torch.nn.functional.mse_loss(predictions, targets)
         loss.backward()
+        del loss, predictions
+        torch.cuda.synchronize(device)
+        baseline = torch.cuda.memory_allocated(device)
+        torch.cuda.reset_peak_memory_stats(device)
         optimizer.step()
         torch.cuda.synchronize(device)
 
@@ -558,7 +564,7 @@ def measure_peak_memory(
             }
         )
 
-        del loss, predictions, optimizer, model, inputs, targets
+        del optimizer, model, inputs, targets
         torch.cuda.empty_cache()
 
     return results
@@ -570,6 +576,7 @@ def render_plot(
     configs: list[BenchmarkConfig],
     output_path: Path,
 ) -> None:
+    plt.style.use("seaborn-v0_8-whitegrid")
     task_names = tuple(benchmark_results["tasks"])
     figure, axes = plt.subplots(
         1,
@@ -577,10 +584,12 @@ def render_plot(
         figsize=(5.7 * len(task_names), 4.8),
         dpi=180,
     )
+    figure.patch.set_facecolor("#f8fafc")
     if len(task_names) == 1:
         axes = [axes]
 
     for axis, task_name in zip(axes, task_names, strict=True):
+        axis.set_facecolor("#ffffff")
         task_results = benchmark_results["tasks"][task_name]["configs"]
         epochs = list(
             range(
@@ -610,6 +619,8 @@ def render_plot(
         axis.set_xlabel("Epoch")
         axis.set_ylabel("Loss")
         axis.grid(alpha=0.25, linewidth=0.7)
+        axis.spines["top"].set_visible(False)
+        axis.spines["right"].set_visible(False)
 
     handles, labels = axes[0].get_legend_handles_labels()
     figure.legend(
@@ -617,7 +628,7 @@ def render_plot(
         labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 0.99),
-        ncol=3,
+        ncol=4,
         frameon=False,
         fontsize=10,
     )
@@ -735,15 +746,23 @@ def main() -> None:
 
     configs = [
         BenchmarkConfig(
-            label="STAC default (last_n_modules=1)",
+            label="STAC default",
             optimizer_kind="stac",
             color="#0f766e",
             linestyle="-",
         ),
         BenchmarkConfig(
-            label="STAC wider AdamW cap (last_n_modules=4)",
+            label="STAC balanced trunk",
+            optimizer_kind="stac",
+            sign_weight_decay=5e-3,
+            color="#b45309",
+            linestyle=(0, (6, 2)),
+        ),
+        BenchmarkConfig(
+            label="STAC wider cap",
             optimizer_kind="stac",
             last_n_modules=4,
+            sign_weight_decay=5e-3,
             color="#c2410c",
             linestyle="-.",
         ),
@@ -796,6 +815,7 @@ def main() -> None:
             "batch_size": args.batch_size,
             "memory_batch_size": args.memory_batch_size,
             "model_init_seed_policy": "per-trial seed matched across optimizers",
+            "memory_measurement_scope": "optimizer.step() on the first state-allocating update",
             "task_names": list(task_names),
             "plot_path": str(plot_path),
             "json_path": str(json_path),
