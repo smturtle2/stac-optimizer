@@ -15,12 +15,12 @@ flowchart LR
 
     subgraph S["State-free sign trunk"]
         C["Earlier modules"]
-        D["Decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>no momentum<br/>no sign-side state"]
+        D["Decoupled weight decay on weight tensors<br/>bias + 1-D params skip decay by default<br/>parameter -= lr * sign(grad)<br/>no momentum, no sign-side state"]
     end
 
     subgraph T["AdamW cap"]
         E["Final tail modules"]
-        F["Standard AdamW<br/>exp_avg + exp_avg_sq"]
+        F["Standard AdamW on the tail<br/>bias + 1-D params skip decay by default<br/>exp_avg + exp_avg_sq"]
     end
 
     A --> B
@@ -56,6 +56,8 @@ are skipped unless they own parameters themselves.
 | `last_n_ratio` | `0.125` | preferred public ratio argument |
 | `last_n_modules` | `None` | explicit count override for the tail |
 | `sign_weight_decay` | `0.5 * weight_decay` in hybrid mode | keeps the sign trunk slightly less aggressive by default |
+| `exclude_bias_from_weight_decay` | `True` | bias tensors skip decoupled weight decay |
+| `exclude_1d_from_weight_decay` | `True` | LayerNorm/RMSNorm scales and other 1-D params skip decoupled weight decay |
 | `sign_lr_scale` | `1.0` | lower it when the sign trunk is too noisy |
 | `foreach` | `False` | more VRAM conservative than the foreach path |
 | `error_if_nonfinite` | `False` | skips the full step on non-finite dense gradients |
@@ -77,6 +79,7 @@ Runtime guarantees that matter in practice:
 
 - deterministic partitioning from `model.named_modules()`
 - no sign-side optimizer state in the sign trunk
+- bias and 1-D parameters skip decoupled weight decay by default
 - explicit sparse-gradient rejection
 - whole-step skip on non-finite dense gradients unless `error_if_nonfinite=True`
 - state-dict validation for roles, module names, parameter names, and tensor shapes
@@ -105,12 +108,12 @@ Primary assets:
 Snapshot from `2026-03-19` on `torch 2.10.0+cu126` and
 `NVIDIA GeForce RTX 3070`:
 
-| Config | Setup | Deep regression val loss | Deep classification val acc | TailNorm val acc | Optimizer state MB | Peak step delta MB |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `STAC default` | `last_n_ratio=0.125`, hybrid default sign decay | `0.014963` | `0.6996` | `0.8037` | `8.133` | `16.134` |
-| `STAC full-decay trunk` | `last_n_ratio=0.125`, `sign_weight_decay=weight_decay` | `0.015065` | `0.7021` | `0.8092` | `8.133` | `16.134` |
-| `STAC wider cap` | `last_n_ratio=0.25` | `0.014767` | `0.6916` | `0.8035` | `24.149` | `32.153` |
-| `AdamW baseline` | full AdamW | `0.013574` | `0.7133` | `0.8266` | `98.227` | `147.341` |
+| Config | Setup | Deep regression val loss | Deep classification val acc | TailNorm val acc | Sequence val acc | Optimizer state MB | Peak step delta MB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `STAC default` | `last_n_ratio=0.125`, hybrid default sign decay, bias/1-D no-decay | `0.015066` | `0.7006` | `0.7984` | `0.6909` | `8.133` | `16.125` |
+| `STAC full-decay trunk` | `last_n_ratio=0.125`, `sign_weight_decay=weight_decay`, bias/1-D no-decay | `0.015075` | `0.6994` | `0.8064` | `0.7089` | `8.133` | `16.125` |
+| `STAC wider cap` | `last_n_ratio=0.25`, bias/1-D no-decay | `0.014726` | `0.6943` | `0.7996` | `0.6909` | `24.149` | `36.125` |
+| `AdamW baseline` | full AdamW with the same no-decay policy in practice | `0.013574` | `0.7129` | `0.8268` | `0.7190` | `98.227` | `147.188` |
 
 Methodology used by the repository benchmark:
 
@@ -119,13 +122,17 @@ Methodology used by the repository benchmark:
 - `5` paired seeds
 - seeded teachers, seeded student initialization, and fixed batch schedules per seed
 - deep residual models instead of shallow toy MLPs
+- a transformer-like sequence task with embeddings and LayerNorm
+- BF16 autocast when the CUDA device supports it
+- the AdamW baseline uses the same bias/1-D no-decay grouping for fairness
 - epoch-by-epoch validation loss curves
 - optimizer-state and peak step-memory probe on the first optimization step
 
 Repository takeaway: the default preset cuts optimizer state from `98.227 MB`
-to `8.133 MB`, the full-decay variant isolates the trunk decay choice at the
-same memory cost, and the wider cap trades more AdamW state for better
-regression. That is repository-local evidence, not a universal claim.
+to `8.133 MB`, the full-decay variant keeps the same memory profile while
+slightly helping the norm-heavy and sequence tasks, and the wider cap trades
+more AdamW state for better regression. That is repository-local evidence, not
+a universal claim.
 
 ## References
 

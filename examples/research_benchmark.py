@@ -168,6 +168,68 @@ class TailNormStudent(nn.Module):
         return self.head(inputs)
 
 
+class SequenceTeacher(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_embedding = nn.Embedding(256, 96)
+        self.position_embedding = nn.Embedding(32, 96)
+        self.blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=96,
+                    nhead=4,
+                    dim_feedforward=384,
+                    dropout=0.0,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(4)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(96)
+        self.head = nn.Linear(96, 8)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(tokens.shape[1], device=tokens.device).unsqueeze(0)
+        hidden = self.token_embedding(tokens) + self.position_embedding(positions)
+        for block in self.blocks:
+            hidden = block(hidden)
+        hidden = self.final_norm(hidden)
+        return self.head(hidden.mean(dim=1))
+
+
+class SequenceStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.token_embedding = nn.Embedding(256, 128)
+        self.position_embedding = nn.Embedding(32, 128)
+        self.blocks = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=128,
+                    nhead=8,
+                    dim_feedforward=512,
+                    dropout=0.0,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                for _ in range(8)
+            ]
+        )
+        self.final_norm = nn.LayerNorm(128)
+        self.head = nn.Linear(128, 8)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        positions = torch.arange(tokens.shape[1], device=tokens.device).unsqueeze(0)
+        hidden = self.token_embedding(tokens) + self.position_embedding(positions)
+        for block in self.blocks:
+            hidden = block(hidden)
+        hidden = self.final_norm(hidden)
+        return self.head(hidden.mean(dim=1))
+
+
 class StateMemoryNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -265,6 +327,37 @@ def make_classification_data(
     )
 
 
+@torch.no_grad()
+def make_sequence_data(
+    seed: int,
+    *,
+    task: TaskConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator().manual_seed(seed)
+    train_tokens = torch.randint(256, (task.train_samples, 32), generator=generator)
+    val_tokens = torch.randint(256, (task.val_samples, 32), generator=generator)
+    teacher = build_seeded_teacher(SequenceTeacher, 25_000 + seed)
+    train_targets = teacher(train_tokens).argmax(dim=1)
+    val_targets = teacher(val_tokens).argmax(dim=1)
+
+    label_noise = torch.rand(task.train_samples, generator=generator) < 0.06
+    noisy_labels = torch.randint(
+        0,
+        8,
+        size=(int(label_noise.sum().item()),),
+        generator=generator,
+    )
+    train_targets[label_noise] = noisy_labels
+
+    return (
+        train_tokens.to(device),
+        train_targets.to(device),
+        val_tokens.to(device),
+        val_targets.to(device),
+    )
+
+
 def batch_indices(
     num_samples: int,
     *,
@@ -277,6 +370,41 @@ def batch_indices(
         torch.randint(num_samples, (batch_size,), generator=generator)
         for _ in range(steps)
     ]
+
+
+def build_adamw_param_groups(
+    model: nn.Module,
+    *,
+    weight_decay: float,
+) -> list[dict[str, object]]:
+    decay_parameters: list[nn.Parameter] = []
+    no_decay_parameters: list[nn.Parameter] = []
+
+    for parameter_name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        local_name = parameter_name.rsplit(".", maxsplit=1)[-1]
+        if local_name == "bias" or parameter.ndim <= 1:
+            no_decay_parameters.append(parameter)
+            continue
+        decay_parameters.append(parameter)
+
+    param_groups: list[dict[str, object]] = []
+    if decay_parameters:
+        param_groups.append(
+            {
+                "params": decay_parameters,
+                "weight_decay": weight_decay,
+            }
+        )
+    if no_decay_parameters:
+        param_groups.append(
+            {
+                "params": no_decay_parameters,
+                "weight_decay": 0.0,
+            }
+        )
+    return param_groups
 
 
 def build_optimizer(
@@ -296,9 +424,8 @@ def build_optimizer(
         )
     if config.optimizer_kind == "adamw":
         return torch.optim.AdamW(
-            model.parameters(),
+            build_adamw_param_groups(model, weight_decay=config.weight_decay),
             lr=config.lr,
-            weight_decay=config.weight_decay,
         )
     raise ValueError(f"Unknown optimizer kind: {config.optimizer_kind}.")
 
@@ -439,6 +566,71 @@ def run_classification_trial(
     }
 
 
+def run_sequence_trial(
+    seed: int,
+    *,
+    config: BenchmarkConfig,
+    task: TaskConfig,
+    device: torch.device,
+) -> dict[str, list[float]]:
+    train_tokens, train_targets, val_tokens, val_targets = make_sequence_data(
+        seed,
+        task=task,
+        device=device,
+    )
+    schedule = batch_indices(
+        task.train_samples,
+        batch_size=task.batch_size,
+        steps=task.steps_per_epoch * task.epochs,
+        seed=30_000 + seed,
+    )
+
+    seed_all(50_000 + seed)
+    model = SequenceStudent().to(device)
+    optimizer = build_optimizer(model, config)
+    autocast_enabled = torch.cuda.is_bf16_supported()
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    val_accuracies: list[float] = []
+
+    for epoch in range(task.epochs):
+        epoch_losses: list[float] = []
+        offset = epoch * task.steps_per_epoch
+        for batch_index in schedule[offset : offset + task.steps_per_epoch]:
+            index = batch_index.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=autocast_enabled,
+            ):
+                logits = model(train_tokens[index])
+                loss = torch.nn.functional.cross_entropy(logits, train_targets[index])
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(float(loss.detach().cpu()))
+
+        train_losses.append(statistics.fmean(epoch_losses))
+        with torch.no_grad():
+            with torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16,
+                enabled=autocast_enabled,
+            ):
+                logits = model(val_tokens)
+                loss = torch.nn.functional.cross_entropy(logits, val_targets)
+            accuracy = (logits.argmax(dim=1) == val_targets).float().mean()
+        val_losses.append(float(loss.detach().cpu()))
+        val_accuracies.append(float(accuracy.detach().cpu()))
+
+    return {
+        "train_loss": train_losses,
+        "val_loss": val_losses,
+        "val_accuracy": val_accuracies,
+    }
+
+
 def aggregate_trials(trials: list[dict[str, list[float]]]) -> dict[str, Any]:
     aggregated: dict[str, Any] = {}
     for metric_name in trials[0]:
@@ -512,6 +704,18 @@ def benchmark_task(
         )
         runner = run_classification_trial
         runner_kwargs = {"tail_norm": True}
+    elif task_name == "sequence_classification":
+        task = TaskConfig(
+            name=task_name,
+            train_samples=3072,
+            val_samples=768,
+            input_dim=32,
+            batch_size=min(batch_size, 96),
+            steps_per_epoch=min(steps_per_epoch, 12),
+            epochs=epochs,
+        )
+        runner = run_sequence_trial
+        runner_kwargs = {}
     else:
         raise ValueError(f"Unknown task: {task_name}.")
 
@@ -793,6 +997,7 @@ def main() -> None:
         "deep_regression",
         "deep_classification",
         "tailnorm_classification",
+        "sequence_classification",
     )
     tasks = {
         task_name: benchmark_task(
@@ -826,6 +1031,9 @@ def main() -> None:
             "model_init_seed_policy": (
                 "paired trials with seeded teachers, seeded student "
                 "initialization, and fixed batch schedules per seed"
+            ),
+            "sequence_autocast_dtype": (
+                "bfloat16 when torch.cuda.is_bf16_supported() else disabled"
             ),
             "memory_measurement_scope": "optimizer.step() on the first state-allocating update",
             "task_names": list(task_names),

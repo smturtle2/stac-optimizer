@@ -74,6 +74,14 @@ class ShapeShiftNet(nn.Module):
         self.head = nn.Linear(1, 2, bias=False)
 
 
+class BiasNormNet(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = nn.Linear(4, 4)
+        self.norm = nn.LayerNorm(4)
+        self.head = nn.Linear(4, 2)
+
+
 class NineLayerNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -261,10 +269,107 @@ def test_default_ratio_is_stored_on_optimizer() -> None:
     optimizer = STAC(model)
 
     assert optimizer.requested_last_n_modules is None
-    assert optimizer.last_n_ratio == pytest.approx(0.18)
-    assert optimizer.adamw_ratio == pytest.approx(0.18)
+    assert optimizer.last_n_ratio == pytest.approx(0.125)
+    assert optimizer.adamw_ratio == pytest.approx(0.125)
     assert optimizer.last_n_modules == 2
     assert optimizer.resolved_last_n_modules == 2
+
+
+def test_weight_decay_exemptions_are_enabled_by_default() -> None:
+    model = BiasNormNet()
+
+    optimizer = STAC(model, lr=0.1, last_n_modules=0, weight_decay=0.1)
+
+    assert optimizer.exclude_bias_from_weight_decay is True
+    assert optimizer.exclude_1d_from_weight_decay is True
+    assert optimizer.param_groups[0]["decay_param_mask"] == (
+        True,
+        False,
+        False,
+        False,
+        True,
+        False,
+    )
+
+
+def test_weight_decay_exemptions_skip_bias_and_1d_parameters(
+    cuda_device: torch.device,
+) -> None:
+    model = BiasNormNet().to(cuda_device)
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_modules=1,
+        weight_decay=0.1,
+        sign_weight_decay=0.1,
+        adamw_weight_decay=0.1,
+    )
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.0)
+            parameter.grad = torch.zeros_like(parameter)
+
+    optimizer.step()
+
+    assert torch.allclose(
+        model.proj.weight.detach(),
+        torch.full_like(model.proj.weight, 0.99),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.proj.bias.detach(),
+        torch.full_like(model.proj.bias, 1.0),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.norm.weight.detach(),
+        torch.full_like(model.norm.weight, 1.0),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.norm.bias.detach(),
+        torch.full_like(model.norm.bias, 1.0),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.head.weight.detach(),
+        torch.full_like(model.head.weight, 0.99),
+        atol=1e-6,
+    )
+    assert torch.allclose(
+        model.head.bias.detach(),
+        torch.full_like(model.head.bias, 1.0),
+        atol=1e-6,
+    )
+
+
+def test_weight_decay_exemptions_can_be_disabled(cuda_device: torch.device) -> None:
+    model = BiasNormNet().to(cuda_device)
+    optimizer = STAC(
+        model,
+        lr=0.1,
+        last_n_modules=1,
+        weight_decay=0.1,
+        sign_weight_decay=0.1,
+        adamw_weight_decay=0.1,
+        exclude_bias_from_weight_decay=False,
+        exclude_1d_from_weight_decay=False,
+    )
+
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(1.0)
+            parameter.grad = torch.zeros_like(parameter)
+
+    optimizer.step()
+
+    for parameter in model.parameters():
+        assert torch.allclose(
+            parameter.detach(),
+            torch.full_like(parameter, 0.99),
+            atol=1e-6,
+        )
 
 
 def test_public_ratio_resolver_supports_preferred_alias() -> None:

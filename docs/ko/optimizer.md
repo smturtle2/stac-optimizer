@@ -15,12 +15,12 @@ flowchart LR
 
     subgraph S["State-free sign trunk"]
         C["앞쪽 module"]
-        D["Decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>momentum 없음<br/>sign-side state 없음"]
+        D["weight tensor에만 decoupled weight decay<br/>bias + 1-D 파라미터는 기본적으로 decay 제외<br/>parameter -= lr * sign(grad)<br/>momentum 없음, sign-side state 없음"]
     end
 
     subgraph T["AdamW cap"]
         E["마지막 tail module"]
-        F["표준 AdamW<br/>exp_avg + exp_avg_sq"]
+        F["tail의 표준 AdamW<br/>bias + 1-D 파라미터는 기본적으로 decay 제외<br/>exp_avg + exp_avg_sq"]
     end
 
     A --> B
@@ -56,6 +56,8 @@ parameter를 갖지 않으면 자동으로 건너뜁니다.
 | `last_n_ratio` | `0.125` | 권장 공개 ratio 인자 |
 | `last_n_modules` | `None` | tail 크기를 명시적으로 override |
 | `sign_weight_decay` | hybrid 모드에서 `0.5 * weight_decay` | 기본적으로 sign trunk를 조금 덜 공격적으로 둠 |
+| `exclude_bias_from_weight_decay` | `True` | bias 파라미터를 decoupled weight decay에서 제외 |
+| `exclude_1d_from_weight_decay` | `True` | LayerNorm/RMSNorm scale 같은 1-D 파라미터를 decoupled weight decay에서 제외 |
 | `sign_lr_scale` | `1.0` | sign trunk가 noisy하면 낮춤 |
 | `foreach` | `False` | foreach 경로보다 VRAM 보수적 |
 | `error_if_nonfinite` | `False` | non-finite dense gradient에서 step 전체 skip |
@@ -76,6 +78,7 @@ parameter를 갖지 않으면 자동으로 건너뜁니다.
 
 - `model.named_modules()` 기반의 결정적 분할
 - sign trunk에서 sign-side optimizer state 없음
+- bias와 1-D 파라미터는 기본적으로 decoupled weight decay 제외
 - sparse gradient 명시적 거부
 - `error_if_nonfinite=False`일 때 non-finite dense gradient step 전체 skip
 - state dict 로드 시 역할, 모듈 이름, 파라미터 이름, state shape 검증
@@ -103,12 +106,12 @@ AdamW로 남깁니다.
 
 `2026-03-19`, `torch 2.10.0+cu126`, `NVIDIA GeForce RTX 3070` 스냅샷:
 
-| 설정 | 구성 | Deep regression val loss | Deep classification val acc | TailNorm val acc | Optimizer state MB | Peak step delta MB |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `STAC default` | `last_n_ratio=0.125`, hybrid 기본 sign decay | `0.014963` | `0.6996` | `0.8037` | `8.133` | `16.134` |
-| `STAC full-decay trunk` | `last_n_ratio=0.125`, `sign_weight_decay=weight_decay` | `0.015065` | `0.7021` | `0.8092` | `8.133` | `16.134` |
-| `STAC wider cap` | `last_n_ratio=0.25` | `0.014767` | `0.6916` | `0.8035` | `24.149` | `32.153` |
-| `AdamW baseline` | full AdamW | `0.013574` | `0.7133` | `0.8266` | `98.227` | `147.341` |
+| 설정 | 구성 | Deep regression val loss | Deep classification val acc | TailNorm val acc | Sequence val acc | Optimizer state MB | Peak step delta MB |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `STAC default` | `last_n_ratio=0.125`, hybrid 기본 sign decay, bias/1-D no-decay | `0.015066` | `0.7006` | `0.7984` | `0.6909` | `8.133` | `16.125` |
+| `STAC full-decay trunk` | `last_n_ratio=0.125`, `sign_weight_decay=weight_decay`, bias/1-D no-decay | `0.015075` | `0.6994` | `0.8064` | `0.7089` | `8.133` | `16.125` |
+| `STAC wider cap` | `last_n_ratio=0.25`, bias/1-D no-decay | `0.014726` | `0.6943` | `0.7996` | `0.6909` | `24.149` | `36.125` |
+| `AdamW baseline` | 실제로는 같은 no-decay 정책을 쓰는 full AdamW | `0.013574` | `0.7129` | `0.8268` | `0.7190` | `98.227` | `147.188` |
 
 이 저장소 벤치마크 방법론:
 
@@ -117,12 +120,15 @@ AdamW로 남깁니다.
 - `5`개 paired seed
 - seeded teacher, seeded student initialization, seed별 고정 batch schedule
 - shallow toy MLP 대신 깊은 residual 모델 사용
+- embedding과 LayerNorm이 들어간 transformer-like sequence task 포함
+- CUDA 장치가 지원하면 BF16 autocast 사용
+- 공정성을 위해 AdamW baseline도 같은 bias/1-D no-decay 그룹핑 사용
 - epoch별 validation loss curve 기록
 - 첫 optimization step에서 optimizer-state와 peak step-memory probe 측정
 
 이 저장소 기준 해석으로는 기본 preset이 optimizer state를 `98.227 MB`에서
-`8.133 MB`로 줄였고, full-decay variant는 같은 메모리에서 trunk decay 선택만
-분리해서 비교하며, wider cap은 더 많은 AdamW state를 써서 회귀 성능을
+`8.133 MB`로 줄였고, full-decay variant는 같은 메모리에서 norm-heavy/sequence
+태스크를 약간 돕고, wider cap은 더 많은 AdamW state를 써서 회귀 성능을
 끌어올립니다. 이 수치는 저장소 내부 근거이지 보편적 보장은 아닙니다.
 
 ## 참고 문헌

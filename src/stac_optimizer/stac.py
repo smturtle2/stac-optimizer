@@ -11,8 +11,21 @@ from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
 _DEFAULT_SIGN_LR_SCALE = 1.0
-_DEFAULT_ADAMW_RATIO = 0.18
+_DEFAULT_ADAMW_RATIO = 0.125
 _LEGACY_SIGN_STATE_KEYS = frozenset({"sign_momentum_buffer"})
+_GROUP_METADATA_KEYS = (
+    "stac_role",
+    "module_names",
+    "param_names",
+    "decay_param_mask",
+    "last_n_ratio",
+    "adamw_ratio",
+    "resolved_last_n_modules",
+    "sign_lr_scale",
+    "exclude_bias_from_weight_decay",
+    "exclude_1d_from_weight_decay",
+    "foreach",
+)
 
 
 @dataclass(frozen=True)
@@ -107,6 +120,22 @@ class _PreparedGroup:
     group: dict[str, object]
     parameters: tuple[nn.Parameter, ...]
     gradients: tuple[torch.Tensor, ...]
+    decay_mask: tuple[bool, ...]
+
+
+def _is_weight_decay_exempt(
+    parameter_name: str,
+    parameter: nn.Parameter,
+    *,
+    exclude_bias_from_weight_decay: bool,
+    exclude_1d_from_weight_decay: bool,
+) -> bool:
+    local_name = parameter_name.rsplit(".", maxsplit=1)[-1]
+    if exclude_bias_from_weight_decay and local_name == "bias":
+        return True
+    if exclude_1d_from_weight_decay and parameter.ndim <= 1:
+        return True
+    return False
 
 
 def _resolve_ratio_alias(
@@ -185,7 +214,7 @@ def partition_trainable_modules(
         model: Module whose trainable parameters should be partitioned.
         last_n_ratio: Preferred public alias for the AdamW tail ratio.
         adamw_ratio: Backward-compatible alias for ``last_n_ratio``. When both
-            ratio arguments are omitted, STAC defaults to ``0.18``.
+            ratio arguments are omitted, STAC defaults to ``0.125``.
         last_n_modules: Optional explicit number of final trainable modules that
             should use AdamW. When provided, it overrides ratio mode.
 
@@ -284,7 +313,7 @@ class STAC(Optimizer):
     Module discovery is deterministic: STAC walks ``model.named_modules()`` in
     registration order and treats each module that owns trainable parameters
     directly (``recurse=False``) as one counted module. By default the final
-    18 percent of that ordered list use AdamW, while all earlier modules use
+    12.5 percent of that ordered list use AdamW, while all earlier modules use
     textbook signSGD with decoupled weight decay. Pass ``last_n_modules`` to
     override the ratio with an explicit module count. ``last_n_ratio`` is the
     preferred public name for that ratio, while ``adamw_ratio`` remains a
@@ -310,6 +339,10 @@ class STAC(Optimizer):
     found that to be a strong starting point on deep classification-style
     workloads without adding any sign-side optimizer state.
 
+    STAC also follows a practical no-decay policy by default: bias tensors and
+    1-D parameters such as LayerNorm or RMSNorm scales are exempt from
+    decoupled weight decay in both sections unless the caller opts back in.
+
     By default STAC uses single-tensor step logic instead of PyTorch's
     ``foreach`` optimizer path. This keeps peak CUDA memory more conservative.
     Set ``foreach=True`` when step throughput matters more than temporary
@@ -330,6 +363,10 @@ class STAC(Optimizer):
             assigned to the AdamW section for the current model.
         nonfinite_skipped_steps: Number of skipped :meth:`step` calls caused by
             non-finite dense gradients while ``error_if_nonfinite=False``.
+        exclude_bias_from_weight_decay: Whether bias tensors skip decoupled
+            weight decay by default.
+        exclude_1d_from_weight_decay: Whether 1-D parameters skip decoupled
+            weight decay by default.
     """
 
     def __init__(
@@ -346,6 +383,8 @@ class STAC(Optimizer):
         weight_decay: float = 0.0,
         sign_weight_decay: float | None = None,
         adamw_weight_decay: float | None = None,
+        exclude_bias_from_weight_decay: bool = True,
+        exclude_1d_from_weight_decay: bool = True,
         amsgrad: bool = False,
         maximize: bool = False,
         error_if_nonfinite: bool = False,
@@ -363,7 +402,7 @@ class STAC(Optimizer):
                 ratio mode.
             last_n_ratio: Preferred public alias for the AdamW tail ratio.
             adamw_ratio: Backward-compatible alias for ``last_n_ratio``. When
-                both ratio arguments are omitted, STAC defaults to ``0.18``.
+                both ratio arguments are omitted, STAC defaults to ``0.125``.
             sign_lr_scale: Multiplicative factor applied to ``lr`` for the
                 sign-based section when both sections are active. The default
                 ``1.0`` matches the shared learning rate. Lower this value when
@@ -379,6 +418,12 @@ class STAC(Optimizer):
                 a benchmark-backed stability starting point. Outside hybrid
                 mode, ``None`` inherits ``weight_decay``.
             adamw_weight_decay: Decoupled weight decay for the AdamW section.
+            exclude_bias_from_weight_decay: If ``True``, parameters whose names
+                end in ``"bias"`` are exempt from decoupled weight decay in
+                both sections.
+            exclude_1d_from_weight_decay: If ``True``, 1-D parameters such as
+                normalization scales are exempt from decoupled weight decay in
+                both sections.
             amsgrad: Enable the AMSGrad variant for the AdamW section.
             maximize: Maximize the objective instead of minimizing it.
             error_if_nonfinite: Raise ``RuntimeError`` when a gradient contains
@@ -441,36 +486,70 @@ class STAC(Optimizer):
         self.resolved_last_n_modules = partition.resolved_last_n_modules
         self.sign_lr_scale = sign_lr_scale
         self.nonfinite_skipped_steps = 0
+        self.exclude_bias_from_weight_decay = exclude_bias_from_weight_decay
+        self.exclude_1d_from_weight_decay = exclude_1d_from_weight_decay
 
         param_groups: list[dict[str, object]] = []
         if self.partition.sign_modules:
+            sign_decay_mask = tuple(
+                not _is_weight_decay_exempt(
+                    parameter_name,
+                    parameter,
+                    exclude_bias_from_weight_decay=exclude_bias_from_weight_decay,
+                    exclude_1d_from_weight_decay=exclude_1d_from_weight_decay,
+                )
+                for parameter_name, parameter in zip(
+                    self.partition.sign_parameter_names,
+                    self.partition.sign_parameters,
+                    strict=True,
+                )
+            )
             param_groups.append(
                 {
                     "params": list(self.partition.sign_parameters),
                     "stac_role": "sign",
                     "module_names": self.partition.sign_module_names,
                     "param_names": self.partition.sign_parameter_names,
+                    "decay_param_mask": sign_decay_mask,
                     "lr": default_sign_lr,
                     "weight_decay": sign_weight_decay,
                     "last_n_ratio": resolved_ratio,
                     "adamw_ratio": resolved_ratio,
                     "resolved_last_n_modules": partition.resolved_last_n_modules,
                     "sign_lr_scale": sign_lr_scale,
+                    "exclude_bias_from_weight_decay": exclude_bias_from_weight_decay,
+                    "exclude_1d_from_weight_decay": exclude_1d_from_weight_decay,
                     "foreach": foreach,
                 }
             )
         if self.partition.adamw_modules:
+            adamw_decay_mask = tuple(
+                not _is_weight_decay_exempt(
+                    parameter_name,
+                    parameter,
+                    exclude_bias_from_weight_decay=exclude_bias_from_weight_decay,
+                    exclude_1d_from_weight_decay=exclude_1d_from_weight_decay,
+                )
+                for parameter_name, parameter in zip(
+                    self.partition.adamw_parameter_names,
+                    self.partition.adamw_parameters,
+                    strict=True,
+                )
+            )
             param_groups.append(
                 {
                     "params": list(self.partition.adamw_parameters),
                     "stac_role": "adamw",
                     "module_names": self.partition.adamw_module_names,
                     "param_names": self.partition.adamw_parameter_names,
+                    "decay_param_mask": adamw_decay_mask,
                     "lr": lr,
                     "weight_decay": adamw_weight_decay,
                     "last_n_ratio": resolved_ratio,
                     "adamw_ratio": resolved_ratio,
                     "resolved_last_n_modules": partition.resolved_last_n_modules,
+                    "exclude_bias_from_weight_decay": exclude_bias_from_weight_decay,
+                    "exclude_1d_from_weight_decay": exclude_1d_from_weight_decay,
                     "foreach": foreach,
                 }
             )
@@ -485,6 +564,8 @@ class STAC(Optimizer):
             "weight_decay": weight_decay,
             "sign_weight_decay": sign_weight_decay,
             "adamw_weight_decay": adamw_weight_decay,
+            "exclude_bias_from_weight_decay": exclude_bias_from_weight_decay,
+            "exclude_1d_from_weight_decay": exclude_1d_from_weight_decay,
             "amsgrad": amsgrad,
             "maximize": maximize,
             "error_if_nonfinite": error_if_nonfinite,
@@ -525,10 +606,16 @@ class STAC(Optimizer):
             group.setdefault("stac_role", "sign")
             group.setdefault("module_names", ())
             group.setdefault("param_names", ())
+            group.setdefault(
+                "decay_param_mask",
+                tuple(True for _ in group.get("params", ())),
+            )
             group.setdefault("last_n_ratio", _DEFAULT_ADAMW_RATIO)
             group.setdefault("adamw_ratio", _DEFAULT_ADAMW_RATIO)
             group.setdefault("resolved_last_n_modules", 0)
             group.setdefault("sign_lr_scale", _DEFAULT_SIGN_LR_SCALE)
+            group.setdefault("exclude_bias_from_weight_decay", True)
+            group.setdefault("exclude_1d_from_weight_decay", True)
             group.setdefault("betas", (0.9, 0.999))
             group.setdefault("eps", 1e-8)
             group.setdefault("amsgrad", False)
@@ -552,6 +639,14 @@ class STAC(Optimizer):
             self.resolved_last_n_modules = len(adamw_module_names)
         if not hasattr(self, "last_n_modules"):
             self.last_n_modules = self.resolved_last_n_modules
+        if not hasattr(self, "exclude_bias_from_weight_decay"):
+            self.exclude_bias_from_weight_decay = bool(
+                self.param_groups[0]["exclude_bias_from_weight_decay"]
+            )
+        if not hasattr(self, "exclude_1d_from_weight_decay"):
+            self.exclude_1d_from_weight_decay = bool(
+                self.param_groups[0]["exclude_1d_from_weight_decay"]
+            )
         self._drop_legacy_sign_state()
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
@@ -563,8 +658,23 @@ class STAC(Optimizer):
         partition before delegating to :meth:`torch.optim.Optimizer.load_state_dict`.
         """
 
+        current_group_metadata = tuple(
+            {
+                key: group[key]
+                for key in _GROUP_METADATA_KEYS
+                if key in group
+            }
+            for group in self.param_groups
+        )
         self._validate_state_dict_partition(state_dict)
         super().load_state_dict(state_dict)
+        for group, metadata in zip(
+            self.param_groups,
+            current_group_metadata,
+            strict=True,
+        ):
+            for key, value in metadata.items():
+                group.setdefault(key, value)
         self._drop_legacy_sign_state()
 
     @torch.no_grad()
@@ -607,10 +717,18 @@ class STAC(Optimizer):
         maximize = bool(group["maximize"])
         parameters: list[nn.Parameter] = []
         gradients: list[torch.Tensor] = []
+        decay_mask: list[bool] = []
+        group_decay_mask = tuple(bool(flag) for flag in group.get("decay_param_mask", ()))
+        if not group_decay_mask:
+            group_decay_mask = tuple(True for _ in group["params"])
         found_nonfinite_on_cpu = False
         found_nonfinite_by_device: dict[torch.device, torch.Tensor] = {}
 
-        for parameter in group["params"]:
+        for parameter, should_decay in zip(
+            group["params"],
+            group_decay_mask,
+            strict=True,
+        ):
             gradient = parameter.grad
             if gradient is None:
                 continue
@@ -635,6 +753,7 @@ class STAC(Optimizer):
 
             parameters.append(parameter)
             gradients.append(-gradient if maximize else gradient)
+            decay_mask.append(should_decay)
 
         found_nonfinite = found_nonfinite_on_cpu or any(
             bool(device_flag.item())
@@ -650,6 +769,7 @@ class STAC(Optimizer):
                     group=group,
                     parameters=(),
                     gradients=(),
+                    decay_mask=(),
                 ),
                 True,
             )
@@ -659,6 +779,7 @@ class STAC(Optimizer):
                 group=group,
                 parameters=tuple(parameters),
                 gradients=tuple(gradients),
+                decay_mask=tuple(decay_mask),
             ),
             False,
         )
@@ -667,6 +788,7 @@ class STAC(Optimizer):
         group = prepared_group.group
         parameters = prepared_group.parameters
         gradients = prepared_group.gradients
+        decay_mask = prepared_group.decay_mask
         if not parameters:
             return
 
@@ -679,14 +801,29 @@ class STAC(Optimizer):
         )
         if use_foreach:
             if weight_decay != 0:
-                torch._foreach_mul_(parameters, 1 - lr * weight_decay)
+                decay_parameters = [
+                    parameter
+                    for parameter, should_decay in zip(
+                        parameters,
+                        decay_mask,
+                        strict=True,
+                    )
+                    if should_decay
+                ]
+                if decay_parameters:
+                    torch._foreach_mul_(decay_parameters, 1 - lr * weight_decay)
 
             directions = torch._foreach_sign(list(gradients))
             torch._foreach_add_(parameters, directions, alpha=-lr)
             return
 
-        for parameter, gradient in zip(parameters, gradients, strict=True):
-            if weight_decay != 0:
+        for parameter, gradient, should_decay in zip(
+            parameters,
+            gradients,
+            decay_mask,
+            strict=True,
+        ):
+            if weight_decay != 0 and should_decay:
                 parameter.mul_(1 - lr * weight_decay)
 
             direction = gradient.sign()
@@ -698,6 +835,7 @@ class STAC(Optimizer):
         group = prepared_group.group
         parameters = prepared_group.parameters
         gradients = prepared_group.gradients
+        decay_mask = prepared_group.decay_mask
         if not parameters:
             return
 
@@ -706,6 +844,78 @@ class STAC(Optimizer):
         eps = float(group["eps"])
         weight_decay = float(group["weight_decay"])
         amsgrad = bool(group["amsgrad"])
+        subsets = {
+            True: (
+                tuple(
+                    parameter
+                    for parameter, should_decay in zip(
+                        parameters,
+                        decay_mask,
+                        strict=True,
+                    )
+                    if should_decay
+                ),
+                tuple(
+                    gradient
+                    for gradient, should_decay in zip(
+                        gradients,
+                        decay_mask,
+                        strict=True,
+                    )
+                    if should_decay
+                ),
+            ),
+            False: (
+                tuple(
+                    parameter
+                    for parameter, should_decay in zip(
+                        parameters,
+                        decay_mask,
+                        strict=True,
+                    )
+                    if not should_decay
+                ),
+                tuple(
+                    gradient
+                    for gradient, should_decay in zip(
+                        gradients,
+                        decay_mask,
+                        strict=True,
+                    )
+                    if not should_decay
+                ),
+            ),
+        }
+
+        for should_decay, (subset_parameters, subset_gradients) in subsets.items():
+            self._step_adamw_subset(
+                parameters=subset_parameters,
+                gradients=subset_gradients,
+                lr=lr,
+                beta1=beta1,
+                beta2=beta2,
+                eps=eps,
+                weight_decay=weight_decay if should_decay else 0.0,
+                amsgrad=amsgrad,
+                foreach=bool(group["foreach"]),
+            )
+
+    def _step_adamw_subset(
+        self,
+        *,
+        parameters: Sequence[nn.Parameter],
+        gradients: Sequence[torch.Tensor],
+        lr: float,
+        beta1: float,
+        beta2: float,
+        eps: float,
+        weight_decay: float,
+        amsgrad: bool,
+        foreach: bool,
+    ) -> None:
+        if not parameters:
+            return
+
         exp_avgs: list[torch.Tensor] = []
         exp_avg_sqs: list[torch.Tensor] = []
         max_exp_avg_sqs: list[torch.Tensor] = []
@@ -741,13 +951,10 @@ class STAC(Optimizer):
             if amsgrad:
                 max_exp_avg_sqs.append(state["max_exp_avg_sq"])
 
-        use_foreach = bool(group["foreach"]) and self._can_use_foreach(
-            parameters,
-            gradients,
-        )
+        use_foreach = foreach and self._can_use_foreach(parameters, gradients)
         adamw_functional(
-            params=parameters,
-            grads=gradients,
+            params=list(parameters),
+            grads=list(gradients),
             exp_avgs=exp_avgs,
             exp_avg_sqs=exp_avg_sqs,
             max_exp_avg_sqs=max_exp_avg_sqs,
