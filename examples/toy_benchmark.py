@@ -25,7 +25,7 @@ class BenchmarkConfig:
     last_n_modules: int = 1
     sign_lr_scale: float = 0.75
     sign_momentum: float = 0.9
-    sign_state_dtype: str | None = None
+    sign_state_dtype: str | None = "auto"
     weight_decay: float = 1e-2
 
 

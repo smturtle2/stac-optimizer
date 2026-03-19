@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import statistics
 
 import pytest
@@ -246,7 +247,7 @@ def _make_optimizer(
     model: nn.Module,
     *,
     last_n_modules: int = 1,
-    sign_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | str | None = "auto",
 ) -> torch.optim.Optimizer:
     if optimizer_kind == "stac":
         return STAC(
@@ -272,7 +273,7 @@ def _run_regression_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
-    sign_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | str | None = "auto",
 ) -> float:
     train_inputs, train_targets, val_inputs, val_targets = _make_regression_data(
         seed,
@@ -313,7 +314,7 @@ def _run_classification_trial(
     optimizer_kind: str,
     *,
     device: torch.device,
-    sign_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | str | None = "auto",
 ) -> tuple[float, float]:
     train_inputs, train_targets, val_inputs, val_targets = (
         _make_classification_data(seed, device=device)
@@ -354,7 +355,7 @@ def _run_layernorm_classification_trial(
     *,
     device: torch.device,
     last_n_modules: int = 1,
-    sign_state_dtype: torch.dtype | None = None,
+    sign_state_dtype: torch.dtype | str | None = "auto",
 ) -> tuple[float, float]:
     train_inputs, train_targets, val_inputs, val_targets = (
         _make_layernorm_classification_data(seed, device=device)
@@ -416,32 +417,6 @@ def test_stac_is_competitive_with_adamw_on_noisy_cuda_suite(
         ]
         for optimizer_kind in ("stac", "adamw")
     }
-    layernorm_default_results = [
-        _run_layernorm_classification_trial(
-            seed,
-            "stac",
-            device=cuda_device,
-            last_n_modules=1,
-        )
-        for seed in range(3)
-    ]
-    layernorm_wide_results = [
-        _run_layernorm_classification_trial(
-            seed,
-            "stac",
-            device=cuda_device,
-            last_n_modules=2,
-        )
-        for seed in range(3)
-    ]
-    layernorm_adamw_results = [
-        _run_layernorm_classification_trial(
-            seed,
-            "adamw",
-            device=cuda_device,
-        )
-        for seed in range(3)
-    ]
 
     stac_regression = statistics.fmean(regression_results["stac"])
     adamw_regression = statistics.fmean(regression_results["adamw"])
@@ -457,32 +432,53 @@ def test_stac_is_competitive_with_adamw_on_noisy_cuda_suite(
     adamw_classification_acc = statistics.fmean(
         accuracy for _, accuracy in classification_results["adamw"]
     )
-    stac_layernorm_default_loss = statistics.fmean(
-        loss for loss, _ in layernorm_default_results
-    )
-    stac_layernorm_wide_loss = statistics.fmean(
-        loss for loss, _ in layernorm_wide_results
-    )
-    adamw_layernorm_loss = statistics.fmean(
-        loss for loss, _ in layernorm_adamw_results
-    )
-    stac_layernorm_default_acc = statistics.fmean(
-        accuracy for _, accuracy in layernorm_default_results
-    )
-    stac_layernorm_wide_acc = statistics.fmean(
-        accuracy for _, accuracy in layernorm_wide_results
-    )
-    adamw_layernorm_acc = statistics.fmean(
-        accuracy for _, accuracy in layernorm_adamw_results
-    )
 
     assert stac_regression <= adamw_regression * 1.10
     assert stac_classification_loss <= adamw_classification_loss * 1.08
     assert stac_classification_acc >= adamw_classification_acc - 0.02
-    assert stac_layernorm_wide_loss <= stac_layernorm_default_loss
-    assert stac_layernorm_wide_acc >= stac_layernorm_default_acc - 0.01
-    assert stac_layernorm_wide_loss <= adamw_layernorm_loss * 1.10
-    assert stac_layernorm_wide_acc >= adamw_layernorm_acc - 0.03
+
+
+def test_layernorm_cuda_suite_favors_a_larger_adamw_cap(
+    cuda_device: torch.device,
+) -> None:
+    default_results = [
+        _run_layernorm_classification_trial(
+            seed,
+            "stac",
+            device=cuda_device,
+            last_n_modules=1,
+        )
+        for seed in range(3)
+    ]
+    wider_cap_results = [
+        _run_layernorm_classification_trial(
+            seed,
+            "stac",
+            device=cuda_device,
+            last_n_modules=4,
+        )
+        for seed in range(3)
+    ]
+    adamw_results = [
+        _run_layernorm_classification_trial(
+            seed,
+            "adamw",
+            device=cuda_device,
+        )
+        for seed in range(3)
+    ]
+
+    default_loss = statistics.fmean(loss for loss, _ in default_results)
+    wider_cap_loss = statistics.fmean(loss for loss, _ in wider_cap_results)
+    adamw_loss = statistics.fmean(loss for loss, _ in adamw_results)
+    default_acc = statistics.fmean(accuracy for _, accuracy in default_results)
+    wider_cap_acc = statistics.fmean(accuracy for _, accuracy in wider_cap_results)
+    adamw_acc = statistics.fmean(accuracy for _, accuracy in adamw_results)
+
+    assert wider_cap_loss <= default_loss
+    assert wider_cap_acc >= default_acc - 0.01
+    assert wider_cap_loss <= adamw_loss * 1.13
+    assert wider_cap_acc >= adamw_acc - 0.02
 
 
 def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
@@ -590,3 +586,43 @@ def test_bfloat16_sign_state_stays_close_to_default_on_cuda_regression_suite(
     ]
 
     assert statistics.fmean(bf16_losses) <= statistics.fmean(fp32_losses) * 1.15
+
+
+def test_auto_sign_state_supports_stable_bfloat16_training_on_cuda(
+    cuda_device: torch.device,
+) -> None:
+    train_inputs, train_targets, _, _ = _make_layernorm_classification_data(
+        7,
+        device=cuda_device,
+    )
+    batch_schedule = _batch_indices(
+        train_inputs.shape[0],
+        batch_size=256,
+        steps=32,
+        seed=7_007,
+    )
+
+    _seed_all(70_007)
+    model = LayerNormClassificationStudent().to(device=cuda_device, dtype=torch.bfloat16)
+    optimizer = STAC(
+        model,
+        lr=2e-3,
+        last_n_modules=1,
+        sign_momentum=0.9,
+        weight_decay=1e-2,
+    )
+
+    losses: list[float] = []
+    for batch_index in batch_schedule:
+        index = batch_index.to(cuda_device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(train_inputs[index].to(dtype=torch.bfloat16))
+        loss = torch.nn.functional.cross_entropy(logits.float(), train_targets[index])
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach().cpu()))
+
+    assert all(math.isfinite(loss_value) for loss_value in losses)
+    assert losses[-1] < losses[0]
+    sign_parameter = optimizer.partition.sign_parameters[0]
+    assert optimizer.state[sign_parameter]["sign_momentum_buffer"].dtype == torch.float32

@@ -12,11 +12,20 @@ momentum-stabilized sign 업데이트로, 마지막 `N`개 학습 모듈은 Adam
 
 ```mermaid
 flowchart LR
-    A[model.named_modules 순서] --> B[직접 trainable parameter를 가진 모듈만 집계]
+    A[model.named_modules 순서]
+    A --> B[직접 trainable parameter를 가진 모듈만 집계]
     B --> C[앞쪽 모듈]
     B --> D[마지막 N개 모듈]
     C --> E[sign trunk<br/>decoupled weight decay<br/>EMA(grad)의 sign 사용<br/>state 1개]
     D --> F[AdamW cap<br/>decoupled weight decay<br/>1차/2차 모멘트]
+
+    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
+    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
+    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
+
+    class A,B neutral;
+    class C,E sign;
+    class D,F adam;
 ```
 
 STAC는 `named_parameters(recurse=False)` 기준으로 직접 trainable parameter를
@@ -42,6 +51,7 @@ parameter를 가지지 않으면 자동으로 건너뜁니다.
 | `sign_momentum` | `0.9` | raw sign보다 momentum 뒤 sign이 더 안정적 |
 | `sign_lr_scale` | `0.75` | hybrid 모드에서 sign 구간을 조금 더 보수적으로 운용 |
 | `sign_state_dtype` | `"auto"` | FP16/BF16 파라미터는 기본적으로 FP32 sign state 사용, 필요하면 BF16으로 더 절약 가능 |
+| `foreach` | `False` | 기본적으로 peak CUDA memory를 낮게 유지, step 처리량이 더 중요할 때만 opt-in |
 | `error_if_nonfinite` | `False` | `NaN`/`Inf` gradient에서 즉시 예외 또는 step 전체 skip |
 
 `sign_state_dtype="auto"`의 동작:
@@ -50,10 +60,30 @@ parameter를 가지지 않으면 자동으로 건너뜁니다.
 - FP32/FP64 파라미터는 파라미터 dtype을 그대로 따릅니다.
 - `None` 또는 `"parameter"`를 주면 항상 파라미터 dtype을 그대로 맞춥니다.
 
+`foreach=False`를 기본값으로 둔 이유도 같습니다. PyTorch 문서상 foreach
+경로는 CUDA에서 더 빠를 수 있지만, 중간 tensor list 때문에 peak memory를 더
+사용할 수 있습니다. STAC는 기본적으로 메모리 절약 쪽을 택하고, 필요할 때만
+사용자가 명시적으로 켜도록 했습니다.
+
+## 추천 프리셋
+
+| 목표 | 추천 설정 |
+| --- | --- |
+| 기본 안정성 | `STAC(model, last_n_modules=1, sign_state_dtype="auto")` |
+| 더 낮은 VRAM | `STAC(model, last_n_modules=1, sign_state_dtype="bf16")` |
+| 더 넓은 adaptive tail | `STAC(model, last_n_modules=2, sign_state_dtype="auto")` |
+
+이 저장소의 CUDA 테스트는 기본 프리셋, BF16 sign-state 변형, 그리고
+LayerNorm 비중이 있는 분류 태스크까지 포함해 단순 MLP head 쪽으로만
+치우치지 않도록 구성했습니다.
+
 ## `last_n_modules` 선택 가이드
 
 - `1`: 작은 MLP/CNN head 위주 모델의 기본값으로 적절합니다.
 - `2`: 마지막 normalization과 head를 함께 AdamW로 두고 싶을 때 좋은 출발점입니다.
+- 이 저장소의 LayerNorm-heavy CUDA stress task에서는 `2`보다 더 큰 cap이
+  추가로 도움이 됐으므로, `2`를 보편 상수처럼 쓰기보다
+  `optimizer.partition`을 보고 판단하는 편이 안전합니다.
 - transformer 계열은 `optimizer.partition`으로 마지막 norm/head가 AdamW cap에
   실제로 들어갔는지 확인하는 편이 안전합니다.
 

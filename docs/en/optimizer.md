@@ -12,11 +12,20 @@ keeping adaptivity where it matters most.
 
 ```mermaid
 flowchart LR
-    A[model.named_modules order] --> B[direct trainable modules only]
+    A[model.named_modules order]
+    A --> B[direct trainable modules only]
     B --> C[earlier modules]
     B --> D[last N modules]
     C --> E[sign trunk<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor]
     D --> F[AdamW cap<br/>decoupled weight decay<br/>first and second moments]
+
+    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
+    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
+    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
+
+    class A,B neutral;
+    class C,E sign;
+    class D,F adam;
 ```
 
 STAC counts only modules that directly own trainable parameters
@@ -42,6 +51,7 @@ conservative setting that benchmarked well in this repository's CUDA study.
 | `sign_momentum` | `0.9` | Momentum before `sign` is markedly more stable than raw sign updates |
 | `sign_lr_scale` | `0.75` | Keeps the sign trunk slightly more conservative in hybrid mode |
 | `sign_state_dtype` | `"auto"` | Uses FP32 sign state for FP16/BF16 params by default; explicit BF16 is available to cut more VRAM |
+| `foreach` | `False` | Keeps peak CUDA memory lower by default; opt in when step throughput matters more |
 | `error_if_nonfinite` | `False` | Either raise immediately or skip the whole step on `NaN`/`Inf` gradients |
 
 `sign_state_dtype="auto"` means:
@@ -50,11 +60,31 @@ conservative setting that benchmarked well in this repository's CUDA study.
 - FP32 and FP64 parameters match their own dtype.
 - `None` or `"parameter"` forces exact parameter-dtype matching instead.
 
+`foreach=False` is a deliberate default. PyTorch documents that the foreach
+optimizer path is often faster on CUDA, but it uses extra peak memory because
+its intermediates are stored as tensor lists. STAC keeps the memory-lean path
+by default and lets users opt in explicitly.
+
+## Recommended Presets
+
+| Goal | Suggested config |
+| --- | --- |
+| Safe default | `STAC(model, last_n_modules=1, sign_state_dtype="auto")` |
+| Lower VRAM | `STAC(model, last_n_modules=1, sign_state_dtype="bf16")` |
+| More adaptive tail | `STAC(model, last_n_modules=2, sign_state_dtype="auto")` |
+
+The repository CUDA tests cover the default preset, the BF16 sign-state
+variant, and a LayerNorm-heavy classification task to reduce benchmark bias
+toward plain MLP heads.
+
 ## Choosing `last_n_modules`
 
 - `1` is the default and works well for small MLP/CNN heads.
 - `2` is often a better starting point when the final normalization layer and
   head both matter.
+- On the repository's LayerNorm-heavy CUDA stress task, larger caps than `2`
+  improved further, so inspect `optimizer.partition` rather than treating `2`
+  as universal.
 - For transformer-style models, inspect `optimizer.partition` and make sure the
   final norm/head are inside the AdamW cap.
 

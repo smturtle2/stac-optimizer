@@ -24,6 +24,25 @@ final trainable modules.
 | VRAM knob | `sign_state_dtype="auto"` or `"bf16"` |
 | Partition inspection | `optimizer.partition.sign_module_names`, `optimizer.partition.adamw_module_names` |
 
+## Layout
+
+```mermaid
+flowchart LR
+    A[Trainable modules in registration order]
+    A --> B[Sign trunk]
+    A --> C[AdamW cap]
+    B --> D[Earlier modules<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor]
+    C --> E[Last N trainable modules<br/>standard AdamW<br/>2 state tensors]
+
+    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
+    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
+    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
+
+    class A neutral;
+    class B,D sign;
+    class C,E adam;
+```
+
 ## Install
 
 ```bash
@@ -57,9 +76,7 @@ optimizer = STAC(
     model,
     lr=1e-3,
     last_n_modules=1,
-    sign_lr_scale=0.75,
     sign_momentum=0.9,
-    sign_state_dtype="bf16",
     weight_decay=1e-2,
     error_if_nonfinite=True,
 )
@@ -80,6 +97,10 @@ print(optimizer.partition.adamw_module_names)
 Pure containers such as `nn.Sequential` are skipped unless they own parameters
 themselves.
 
+`sign_state_dtype="auto"` is the default. Switch to `"bf16"` on CUDA when you
+want a smaller sign-state footprint and the small precision trade-off is
+acceptable for your workload.
+
 ## CUDA Benchmark
 
 The repository benchmark uses separate train/validation splits, `5` paired
@@ -93,7 +114,7 @@ Latest snapshot from `2026-03-19` on `torch 2.10.0+cu126` and
 
 | Config | Regression val loss | Classification val loss | Classification val acc | Optimizer state MB |
 | --- | ---: | ---: | ---: | ---: |
-| `STAC` default (`last_n_modules=1`) | `0.045115` | `0.278679` | `0.9016` | `3.637` |
+| `STAC` default (`last_n_modules=1`) | `0.045044` | `0.278679` | `0.9016` | `3.637` |
 | `STAC` wider AdamW section (`last_n_modules=2`) | `0.044285` | `0.281579` | `0.9039` | `3.762` |
 | `STAC` bf16 sign state | `0.045177` | `0.281705` | `0.9004` | `1.821` |
 | `AdamW` baseline | `0.043068` | `0.280832` | `0.9055` | `7.270` |
@@ -102,6 +123,9 @@ In this run, the default STAC configuration used about half the optimizer state
 of AdamW, and the BF16 sign-state variant reduced that state again with only a
 small quality delta. Full methodology and all ablations live in the linked docs
 and JSON report.
+
+The figure also includes a LayerNorm-heavy classification stress task. Treat
+`last_n_modules` as a tuning knob, not a universal constant.
 
 ## Verify
 
