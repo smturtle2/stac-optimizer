@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">STAC optimizer flowchart</title>
+  <desc id="desc">Trainable modules are split by order into a signSGD trunk and an AdamW cap.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="640" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7FAFC"/>
+      <stop offset="1" stop-color="#EEF4FF"/>
+    </linearGradient>
+    <linearGradient id="signFill" x1="0" y1="0" x2="0" y2="220" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#DFF6EC"/>
+      <stop offset="1" stop-color="#C2E7DA"/>
+    </linearGradient>
+    <linearGradient id="adamFill" x1="0" y1="0" x2="0" y2="220" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#E1ECFF"/>
+      <stop offset="1" stop-color="#CADBFF"/>
+    </linearGradient>
+    <filter id="shadow" x="-20" y="-20" width="200" height="200" filterUnits="objectBoundingBox">
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#0F172A" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0 0L12 6L0 12V0Z" fill="#355070"/>
+    </marker>
+  </defs>
+
+  <rect width="1280" height="640" rx="32" fill="url(#bg)"/>
+  <circle cx="140" cy="112" r="160" fill="#D9EAFB" fill-opacity="0.45"/>
+  <circle cx="1150" cy="560" r="190" fill="#D8F3E7" fill-opacity="0.45"/>
+
+  <text x="72" y="92" fill="#0F172A" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="36" font-weight="700">STAC Flow</text>
+  <text x="72" y="132" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="19">Split trainable modules by order, keep the tail adaptive, and leave the trunk on plain signSGD.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="84" y="212" width="320" height="172" rx="24" fill="#FFFFFF" stroke="#9FB6D9" stroke-width="2"/>
+    <text x="116" y="262" fill="#102A43" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="28" font-weight="700">Module Scan</text>
+    <text x="116" y="308" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="20">Walk `model.named_modules()` in registration order.</text>
+    <text x="116" y="340" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="20">Count only modules that directly own trainable parameters.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="478" y="188" width="324" height="220" rx="26" fill="#FFFFFF" stroke="#8FAFD4" stroke-width="2"/>
+    <text x="514" y="246" fill="#102A43" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="28" font-weight="700">Deterministic Partition</text>
+    <text x="514" y="294" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="20">Earlier trainable modules</text>
+    <text x="514" y="326" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="20">become the sign trunk.</text>
+    <text x="514" y="366" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="20">The last `N` trainable modules</text>
+    <text x="514" y="398" fill="#355070" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="20">become the AdamW cap.</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="878" y="132" width="322" height="198" rx="28" fill="url(#signFill)" stroke="#2D6A4F" stroke-width="2.5"/>
+    <text x="912" y="188" fill="#1B4332" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="30" font-weight="700">SignSGD Trunk</text>
+    <text x="912" y="234" fill="#2D6A4F" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">Decoupled weight decay</text>
+    <text x="912" y="268" fill="#2D6A4F" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">`parameter -= lr * sign(grad)`</text>
+    <text x="912" y="302" fill="#2D6A4F" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">No momentum</text>
+    <text x="912" y="336" fill="#2D6A4F" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">No sign-side optimizer tensors</text>
+  </g>
+
+  <g filter="url(#shadow)">
+    <rect x="878" y="372" width="322" height="198" rx="28" fill="url(#adamFill)" stroke="#1D4ED8" stroke-width="2.5"/>
+    <text x="912" y="428" fill="#1E3A8A" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="30" font-weight="700">AdamW Cap</text>
+    <text x="912" y="474" fill="#1D4ED8" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">Last `N` trainable modules</text>
+    <text x="912" y="508" fill="#1D4ED8" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">Standard AdamW step</text>
+    <text x="912" y="542" fill="#1D4ED8" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="21">`exp_avg` + `exp_avg_sq` state</text>
+  </g>
+
+  <path d="M404 298H456" stroke="#355070" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow)"/>
+  <path d="M802 298H846C866 298 866 236 886 236" stroke="#355070" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow)"/>
+  <path d="M802 298H846C866 298 866 470 886 470" stroke="#355070" stroke-width="4" stroke-linecap="round" marker-end="url(#arrow)"/>
+
+  <text x="72" y="602" fill="#486581" font-family="'Segoe UI', 'Noto Sans KR', sans-serif" font-size="18">Default split: last 1 trainable module uses AdamW, earlier modules use plain signSGD.</text>
+</svg>

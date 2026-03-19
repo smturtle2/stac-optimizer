@@ -30,9 +30,7 @@ class BenchmarkConfig:
     optimizer_kind: str
     lr: float = 2e-3
     last_n_modules: int = 1
-    sign_lr_scale: float = 0.75
-    sign_momentum: float = 0.9
-    sign_state_dtype: str | None = "auto"
+    sign_lr_scale: float = 1.0
     weight_decay: float = 1e-2
     color: str = "#1f77b4"
     linestyle: str | tuple[int, tuple[int, ...]] = "-"
@@ -49,119 +47,137 @@ class TaskConfig:
     epochs: int
 
 
-class RegressionTeacher(nn.Module):
-    def __init__(self) -> None:
+class ResidualBlock(nn.Module):
+    def __init__(self, width: int, *, use_layernorm: bool) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(24, 48),
-            nn.Tanh(),
-            nn.Linear(48, 16),
-            nn.Tanh(),
-            nn.Linear(16, 3),
-        )
+        self.fc1 = nn.Linear(width, width)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(width, width)
+        self.norm = nn.LayerNorm(width) if use_layernorm else nn.Identity()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs)
+        residual = inputs
+        inputs = self.fc1(inputs)
+        inputs = self.act(inputs)
+        inputs = self.fc2(inputs)
+        return residual + self.norm(inputs)
 
 
-class RegressionStudent(nn.Module):
+class DeepRegressionTeacher(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(24, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 3),
+        self.stem = nn.Linear(48, 96)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(96, use_layernorm=False) for _ in range(5)]
         )
+        self.head = nn.Linear(96, 6)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs)
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        return self.head(inputs)
 
 
-class ClassificationTeacher(nn.Module):
+class DeepRegressionStudent(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(20, 40),
-            nn.Tanh(),
-            nn.Linear(40, 24),
-            nn.Tanh(),
-            nn.Linear(24, 4),
+        self.stem = nn.Linear(48, 128)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(128, use_layernorm=False) for _ in range(10)]
         )
+        self.head = nn.Linear(128, 6)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs)
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        return self.head(inputs)
 
 
-class ClassificationStudent(nn.Module):
+class DeepClassificationTeacher(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(20, 64),
-            nn.ReLU(),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 4),
+        self.stem = nn.Linear(64, 96)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(96, use_layernorm=True) for _ in range(5)]
         )
+        self.final_norm = nn.LayerNorm(96)
+        self.head = nn.Linear(96, 6)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs)
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        inputs = self.final_norm(inputs)
+        return self.head(inputs)
 
 
-class LayerNormClassificationTeacher(nn.Module):
+class DeepClassificationStudent(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(32, 64),
-            nn.Tanh(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 64),
-            nn.Tanh(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 5),
+        self.stem = nn.Linear(64, 128)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(128, use_layernorm=True) for _ in range(10)]
         )
+        self.final_norm = nn.LayerNorm(128)
+        self.head = nn.Linear(128, 6)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs)
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        inputs = self.final_norm(inputs)
+        return self.head(inputs)
 
 
-class LayerNormClassificationStudent(nn.Module):
+class TailNormTeacher(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(32, 96),
-            nn.GELU(),
-            nn.LayerNorm(96),
-            nn.Linear(96, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-            nn.Linear(64, 5),
+        self.stem = nn.Linear(64, 96)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(96, use_layernorm=False) for _ in range(5)]
         )
+        self.bridge = nn.Linear(96, 96)
+        self.final_norm = nn.LayerNorm(96)
+        self.head = nn.Linear(96, 6)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.network(inputs)
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        inputs = self.bridge(inputs)
+        inputs = self.final_norm(inputs)
+        return self.head(inputs)
+
+
+class TailNormStudent(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stem = nn.Linear(64, 128)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(128, use_layernorm=False) for _ in range(10)]
+        )
+        self.bridge = nn.Linear(128, 128)
+        self.final_norm = nn.LayerNorm(128)
+        self.head = nn.Linear(128, 6)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        inputs = self.bridge(inputs)
+        inputs = self.final_norm(inputs)
+        return self.head(inputs)
 
 
 class StateMemoryNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(256, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 64),
-            nn.ReLU(),
-            nn.Linear(64, 8),
+        self.stem = nn.Linear(256, 1024)
+        self.blocks = nn.Sequential(
+            *[ResidualBlock(1024, use_layernorm=False) for _ in range(6)]
         )
+        self.head = nn.Linear(1024, 16)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.layers(inputs)
+        inputs = self.stem(inputs)
+        inputs = self.blocks(inputs)
+        return self.head(inputs)
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -187,15 +203,15 @@ def make_regression_data(
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(task.train_samples, task.input_dim, generator=generator)
     val_inputs = torch.randn(task.val_samples, task.input_dim, generator=generator)
-    teacher = RegressionTeacher()
-    train_targets = teacher(train_inputs) + 0.2 * torch.randn(
+    teacher = DeepRegressionTeacher()
+    train_targets = teacher(train_inputs) + 0.10 * torch.randn(
         task.train_samples,
-        3,
+        6,
         generator=generator,
     )
-    val_targets = teacher(val_inputs) + 0.2 * torch.randn(
+    val_targets = teacher(val_inputs) + 0.10 * torch.randn(
         task.val_samples,
-        3,
+        6,
         generator=generator,
     )
     return (
@@ -212,49 +228,19 @@ def make_classification_data(
     *,
     task: TaskConfig,
     device: torch.device,
+    tail_norm: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     generator = torch.Generator().manual_seed(seed)
     train_inputs = torch.randn(task.train_samples, task.input_dim, generator=generator)
     val_inputs = torch.randn(task.val_samples, task.input_dim, generator=generator)
-    teacher = ClassificationTeacher()
+    teacher = TailNormTeacher() if tail_norm else DeepClassificationTeacher()
     train_targets = teacher(train_inputs).argmax(dim=1)
     val_targets = teacher(val_inputs).argmax(dim=1)
 
     label_noise = torch.rand(task.train_samples, generator=generator) < 0.08
     noisy_labels = torch.randint(
         0,
-        4,
-        size=(int(label_noise.sum().item()),),
-        generator=generator,
-    )
-    train_targets[label_noise] = noisy_labels
-
-    return (
-        train_inputs.to(device),
-        train_targets.to(device),
-        val_inputs.to(device),
-        val_targets.to(device),
-    )
-
-
-@torch.no_grad()
-def make_layernorm_classification_data(
-    seed: int,
-    *,
-    task: TaskConfig,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    train_inputs = torch.randn(task.train_samples, task.input_dim, generator=generator)
-    val_inputs = torch.randn(task.val_samples, task.input_dim, generator=generator)
-    teacher = LayerNormClassificationTeacher()
-    train_targets = teacher(train_inputs).argmax(dim=1)
-    val_targets = teacher(val_inputs).argmax(dim=1)
-
-    label_noise = torch.rand(task.train_samples, generator=generator) < 0.10
-    noisy_labels = torch.randint(
-        0,
-        5,
+        6,
         size=(int(label_noise.sum().item()),),
         generator=generator,
     )
@@ -292,8 +278,6 @@ def build_optimizer(
             lr=config.lr,
             last_n_modules=config.last_n_modules,
             sign_lr_scale=config.sign_lr_scale,
-            sign_momentum=config.sign_momentum,
-            sign_state_dtype=config.sign_state_dtype,
             weight_decay=config.weight_decay,
         )
     if config.optimizer_kind == "adamw":
@@ -361,7 +345,7 @@ def run_regression_trial(
     )
 
     seed_all(30_000 + seed)
-    model = RegressionStudent().to(device)
+    model = DeepRegressionStudent().to(device)
     optimizer = build_optimizer(model, config)
 
     train_losses: list[float] = []
@@ -394,11 +378,13 @@ def run_classification_trial(
     config: BenchmarkConfig,
     task: TaskConfig,
     device: torch.device,
+    tail_norm: bool,
 ) -> dict[str, list[float]]:
     train_inputs, train_targets, val_inputs, val_targets = make_classification_data(
         seed,
         task=task,
         device=device,
+        tail_norm=tail_norm,
     )
     schedule = batch_indices(
         task.train_samples,
@@ -408,60 +394,7 @@ def run_classification_trial(
     )
 
     seed_all(40_000 + seed)
-    model = ClassificationStudent().to(device)
-    optimizer = build_optimizer(model, config)
-
-    train_losses: list[float] = []
-    val_losses: list[float] = []
-    val_accuracies: list[float] = []
-
-    for epoch in range(task.epochs):
-        epoch_losses: list[float] = []
-        offset = epoch * task.steps_per_epoch
-        for batch_index in schedule[offset : offset + task.steps_per_epoch]:
-            index = batch_index.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(train_inputs[index])
-            loss = torch.nn.functional.cross_entropy(logits, train_targets[index])
-            loss.backward()
-            optimizer.step()
-            epoch_losses.append(float(loss.detach().cpu()))
-
-        train_losses.append(statistics.fmean(epoch_losses))
-        metrics = evaluate_classification(model, val_inputs, val_targets)
-        val_losses.append(metrics["loss"])
-        val_accuracies.append(metrics["accuracy"])
-
-    return {
-        "train_loss": train_losses,
-        "val_loss": val_losses,
-        "val_accuracy": val_accuracies,
-    }
-
-
-def run_layernorm_classification_trial(
-    seed: int,
-    *,
-    config: BenchmarkConfig,
-    task: TaskConfig,
-    device: torch.device,
-) -> dict[str, list[float]]:
-    train_inputs, train_targets, val_inputs, val_targets = (
-        make_layernorm_classification_data(
-            seed,
-            task=task,
-            device=device,
-        )
-    )
-    schedule = batch_indices(
-        task.train_samples,
-        batch_size=task.batch_size,
-        steps=task.steps_per_epoch * task.epochs,
-        seed=30_000 + seed,
-    )
-
-    seed_all(50_000 + seed)
-    model = LayerNormClassificationStudent().to(device)
+    model = TailNormStudent().to(device) if tail_norm else DeepClassificationStudent().to(device)
     optimizer = build_optimizer(model, config)
 
     train_losses: list[float] = []
@@ -529,46 +462,49 @@ def benchmark_task(
     batch_size: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    if task_name == "regression":
+    if task_name == "deep_regression":
         task = TaskConfig(
             name=task_name,
             train_samples=4096,
-            val_samples=512,
-            input_dim=24,
+            val_samples=1024,
+            input_dim=48,
             batch_size=batch_size,
             steps_per_epoch=steps_per_epoch,
             epochs=epochs,
         )
         runner = run_regression_trial
-    elif task_name == "classification":
+        runner_kwargs: dict[str, Any] = {}
+    elif task_name == "deep_classification":
         task = TaskConfig(
             name=task_name,
             train_samples=4096,
-            val_samples=512,
-            input_dim=20,
+            val_samples=1024,
+            input_dim=64,
             batch_size=batch_size,
             steps_per_epoch=steps_per_epoch,
             epochs=epochs,
         )
         runner = run_classification_trial
-    elif task_name == "layernorm_classification":
+        runner_kwargs = {"tail_norm": False}
+    elif task_name == "tailnorm_classification":
         task = TaskConfig(
             name=task_name,
             train_samples=4096,
-            val_samples=512,
-            input_dim=32,
+            val_samples=1024,
+            input_dim=64,
             batch_size=batch_size,
             steps_per_epoch=steps_per_epoch,
             epochs=epochs,
         )
-        runner = run_layernorm_classification_trial
+        runner = run_classification_trial
+        runner_kwargs = {"tail_norm": True}
     else:
         raise ValueError(f"Unknown task: {task_name}.")
 
     config_results: dict[str, Any] = {}
     for config in configs:
         trials = [
-            runner(seed, config=config, task=task, device=device)
+            runner(seed, config=config, task=task, device=device, **runner_kwargs)
             for seed in range(seeds)
         ]
         config_results[config.label] = {
@@ -596,10 +532,11 @@ def measure_peak_memory(
         model = StateMemoryNet().to(device)
         optimizer = build_optimizer(model, config)
         inputs = torch.randn(batch_size, 256, device=device)
-        targets = torch.randn(batch_size, 8, device=device)
+        targets = torch.randn(batch_size, 16, device=device)
 
         optimizer.zero_grad(set_to_none=True)
         torch.cuda.reset_peak_memory_stats(device)
+        baseline = torch.cuda.memory_allocated(device)
         predictions = model(inputs)
         loss = torch.nn.functional.mse_loss(predictions, targets)
         loss.backward()
@@ -610,11 +547,13 @@ def measure_peak_memory(
             {
                 "label": config.label,
                 "optimizer_state_mb": optimizer_state_megabytes(optimizer),
-                "peak_allocated_mb": torch.cuda.max_memory_allocated(device)
+                "peak_delta_mb": (
+                    torch.cuda.max_memory_allocated(device) - baseline
+                )
                 / (1024**2),
-                "peak_reserved_mb": torch.cuda.max_memory_reserved(device)
-                / (1024**2),
-                "steady_allocated_mb": torch.cuda.memory_allocated(device)
+                "steady_delta_mb": (
+                    torch.cuda.memory_allocated(device) - baseline
+                )
                 / (1024**2),
             }
         )
@@ -721,24 +660,21 @@ def print_task_summary(
 
 def print_memory_summary(memory_results: list[dict[str, Any]]) -> None:
     print("\n## memory")
-    print(
-        "| Optimizer | Optimizer state MB | Peak allocated MB | Peak reserved MB |"
-    )
+    print("| Optimizer | Optimizer state MB | Peak delta MB | Steady delta MB |")
     print("| --- | ---: | ---: | ---: |")
     for result in memory_results:
         print(
             f"| {result['label']} | {result['optimizer_state_mb']:.3f} | "
-            f"{result['peak_allocated_mb']:.3f} | "
-            f"{result['peak_reserved_mb']:.3f} |"
+            f"{result['peak_delta_mb']:.3f} | "
+            f"{result['steady_delta_mb']:.3f} |"
         )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run a CUDA-only research benchmark for STAC with train/validation "
-            "splits, multiple seeds, epoch-by-epoch loss curves, and peak CUDA "
-            "memory stats."
+            "Run a CUDA-only research benchmark for STAC with held-out splits, "
+            "multiple seeds, epoch-by-epoch loss curves, and peak CUDA memory."
         )
     )
     parser.add_argument(
@@ -755,13 +691,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--epochs",
         type=int,
-        default=12,
+        default=10,
         help="Number of epochs to record in the loss curves.",
     )
     parser.add_argument(
         "--steps-per-epoch",
         type=int,
-        default=20,
+        default=16,
         help="Mini-batch updates per epoch.",
     )
     parser.add_argument(
@@ -773,7 +709,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-batch-size",
         type=int,
-        default=128,
+        default=32,
         help="Batch size for the peak-memory probe.",
     )
     parser.add_argument(
@@ -805,25 +741,11 @@ def main() -> None:
             linestyle="-",
         ),
         BenchmarkConfig(
-            label="STAC wider AdamW section (last_n_modules=2)",
+            label="STAC wider AdamW cap (last_n_modules=4)",
             optimizer_kind="stac",
-            last_n_modules=2,
+            last_n_modules=4,
             color="#c2410c",
             linestyle="-.",
-        ),
-        BenchmarkConfig(
-            label="STAC bf16 sign state",
-            optimizer_kind="stac",
-            sign_state_dtype="bf16",
-            color="#7c3aed",
-            linestyle="--",
-        ),
-        BenchmarkConfig(
-            label="STAC plain sign update",
-            optimizer_kind="stac",
-            sign_momentum=0.0,
-            color="#b45309",
-            linestyle=":",
         ),
         BenchmarkConfig(
             label="AdamW baseline",
@@ -840,9 +762,9 @@ def main() -> None:
     )
 
     task_names = (
-        "regression",
-        "classification",
-        "layernorm_classification",
+        "deep_regression",
+        "deep_classification",
+        "tailnorm_classification",
     )
     tasks = {
         task_name: benchmark_task(

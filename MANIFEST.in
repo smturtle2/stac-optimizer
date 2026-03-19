@@ -1,5 +1,4 @@
 include README.ko.md
-recursive-include docs *.md
+recursive-include docs *.md *.svg *.png *.json
 recursive-include examples *.py
 prune .github
-prune docs/benchmark

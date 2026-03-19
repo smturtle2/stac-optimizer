@@ -9,18 +9,7 @@ from torch import nn
 from torch.optim.adamw import adamw as adamw_functional
 from torch.optim import Optimizer
 
-_DEFAULT_SIGN_LR_SCALE = 0.75
-_AUTO_SIGN_STATE_DTYPE = "auto"
-_SIGN_STATE_DTYPE_ALIASES = {
-    "float16": torch.float16,
-    "half": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "float64": torch.float64,
-    "fp64": torch.float64,
-}
+_DEFAULT_SIGN_LR_SCALE = 1.0
 
 
 @dataclass(frozen=True)
@@ -173,10 +162,9 @@ class STAC(Optimizer):
     registration order and treats each module that owns trainable parameters
     directly (``recurse=False``) as one counted module. The final
     ``last_n_modules`` of that ordered list use AdamW, while all earlier
-    modules use a sign-based update. By default the sign-based section
-    accumulates gradients with momentum before taking the sign, which is
-    markedly more stable than plain signSGD. Set ``sign_momentum=0.0`` to
-    recover textbook signSGD.
+    modules use textbook signSGD with decoupled weight decay. The sign-based
+    section is intentionally stateless: it keeps no momentum, EMA, or other
+    sign-side optimizer tensors.
 
     Pure containers such as ``nn.Sequential`` are skipped unless they own
     trainable parameters themselves. In practice this means the counted modules
@@ -185,16 +173,9 @@ class STAC(Optimizer):
 
     When both sections are active, STAC internally uses
     ``sign_lr_scale * lr`` for the sign-based section and ``lr`` for the
-    AdamW section. The default ``sign_lr_scale=0.75`` keeps the sign path
-    slightly more conservative while preserving a single public learning rate
-    knob.
-
-    The sign-based section can keep its momentum buffer in a configurable
-    floating dtype via ``sign_state_dtype``. By default STAC uses an ``"auto"``
-    policy: low-precision parameter tensors (``float16`` or ``bfloat16``) keep
-    their sign momentum state in ``float32`` for stability, while higher
-    precision tensors match the parameter dtype. You can still force a lower
-    precision state such as ``torch.bfloat16`` when VRAM matters more.
+    AdamW section. The default ``sign_lr_scale=1.0`` keeps the public learning
+    rate semantics simple while still allowing a more conservative sign step
+    when a workload needs it.
 
     By default STAC uses single-tensor step logic instead of PyTorch's
     ``foreach`` optimizer path. This keeps peak CUDA memory more conservative.
@@ -220,8 +201,6 @@ class STAC(Optimizer):
         lr: float = 1e-3,
         last_n_modules: int = 1,
         sign_lr_scale: float = _DEFAULT_SIGN_LR_SCALE,
-        sign_momentum: float = 0.9,
-        sign_state_dtype: torch.dtype | str | None = _AUTO_SIGN_STATE_DTYPE,
         betas: tuple[float, float] = (0.9, 0.999),
         eps: float = 1e-8,
         weight_decay: float = 0.0,
@@ -243,17 +222,9 @@ class STAC(Optimizer):
                 AdamW. Earlier trainable modules use the sign-based section.
             sign_lr_scale: Multiplicative factor applied to ``lr`` for the
                 sign-based section when both sections are active. The default
-                ``0.75`` is slightly more conservative than the AdamW section
-                and tested well on this repository's held-out CUDA suite.
-            sign_momentum: EMA factor applied before taking the sign in the
-                sign-based section. Set ``0.0`` to recover plain signSGD.
-            sign_state_dtype: Optional floating dtype used for the sign-section
-                momentum buffer. The default ``"auto"`` keeps low-precision
-                parameters on ``float32`` momentum state for stability and
-                otherwise matches the parameter dtype. Use ``None`` or
-                ``"parameter"`` to always match the parameter dtype. Useful for
-                reducing optimizer-state VRAM, for example with
-                ``torch.bfloat16`` on CUDA.
+                ``1.0`` matches the shared learning rate. Lower this value when
+                you want a more conservative sign step without changing the
+                AdamW cap.
             betas: AdamW first- and second-moment coefficients for the AdamW
                 section.
             eps: Numerical stability term for the AdamW section.
@@ -281,13 +252,6 @@ class STAC(Optimizer):
             raise ValueError(f"Invalid beta parameter at index 0: {beta1}.")
         if not 0.0 <= beta2 < 1.0:
             raise ValueError(f"Invalid beta parameter at index 1: {beta2}.")
-        if not 0.0 <= sign_momentum < 1.0:
-            raise ValueError(
-                f"Invalid sign_momentum value: {sign_momentum}."
-            )
-        resolved_sign_state_dtype = self._resolve_sign_state_dtype(
-            sign_state_dtype
-        )
 
         partition = partition_trainable_modules(
             model,
@@ -324,8 +288,6 @@ class STAC(Optimizer):
                     "lr": default_sign_lr,
                     "weight_decay": sign_weight_decay,
                     "sign_lr_scale": sign_lr_scale,
-                    "sign_momentum": sign_momentum,
-                    "sign_state_dtype": resolved_sign_state_dtype,
                     "foreach": foreach,
                 }
             )
@@ -345,8 +307,6 @@ class STAC(Optimizer):
         defaults = {
             "lr": lr,
             "sign_lr_scale": sign_lr_scale,
-            "sign_momentum": sign_momentum,
-            "sign_state_dtype": resolved_sign_state_dtype,
             "betas": betas,
             "eps": eps,
             "weight_decay": weight_decay,
@@ -373,52 +333,6 @@ class STAC(Optimizer):
         if value <= 0.0:
             raise ValueError(f"Invalid {name}: {value}.")
 
-    @staticmethod
-    def _resolve_sign_state_dtype(
-        value: torch.dtype | str | None,
-    ) -> torch.dtype | str | None:
-        if value is None:
-            return None
-        if isinstance(value, str):
-            normalized_value = value.strip().lower()
-            if normalized_value == _AUTO_SIGN_STATE_DTYPE:
-                return _AUTO_SIGN_STATE_DTYPE
-            if normalized_value in {"parameter", "match_parameter"}:
-                return None
-            resolved_value = _SIGN_STATE_DTYPE_ALIASES.get(normalized_value)
-            if resolved_value is None:
-                raise ValueError(
-                    "sign_state_dtype must be a floating torch.dtype, None, "
-                    'or one of: auto, match_parameter, parameter, '
-                    "or one of: "
-                    f"{', '.join(sorted(_SIGN_STATE_DTYPE_ALIASES))}."
-                )
-            value = resolved_value
-
-        if not isinstance(value, torch.dtype):
-            raise ValueError(
-                "sign_state_dtype must be a floating torch.dtype, None, or "
-                "a supported string alias."
-            )
-        if not torch.empty((), dtype=value).is_floating_point():
-            raise ValueError(
-                "sign_state_dtype must be a floating-point dtype."
-            )
-        return value
-
-    @staticmethod
-    def _get_sign_state_dtype(
-        parameter: nn.Parameter,
-        sign_state_dtype: torch.dtype | str | None,
-    ) -> torch.dtype:
-        if sign_state_dtype == _AUTO_SIGN_STATE_DTYPE:
-            if parameter.dtype in {torch.float16, torch.bfloat16}:
-                return torch.float32
-            return parameter.dtype
-        if sign_state_dtype is None:
-            return parameter.dtype
-        return sign_state_dtype
-
     def add_param_group(self, param_group: dict[str, object]) -> None:
         if getattr(self, "_initializing", False):
             super().add_param_group(param_group)
@@ -439,13 +353,12 @@ class STAC(Optimizer):
             group.setdefault("module_names", ())
             group.setdefault("param_names", ())
             group.setdefault("sign_lr_scale", _DEFAULT_SIGN_LR_SCALE)
-            group.setdefault("sign_momentum", 0.0)
-            group.setdefault("sign_state_dtype", None)
             group.setdefault("betas", (0.9, 0.999))
             group.setdefault("eps", 1e-8)
             group.setdefault("amsgrad", False)
             group.setdefault("error_if_nonfinite", False)
             group.setdefault("foreach", False)
+        self._drop_legacy_sign_state()
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
         """Load optimizer state while preserving the current STAC partition.
@@ -458,6 +371,7 @@ class STAC(Optimizer):
 
         self._validate_state_dict_partition(state_dict)
         super().load_state_dict(state_dict)
+        self._drop_legacy_sign_state()
 
     @torch.no_grad()
     def step(
@@ -490,11 +404,8 @@ class STAC(Optimizer):
         lr = float(group["lr"])
         weight_decay = float(group["weight_decay"])
         maximize = bool(group["maximize"])
-        sign_momentum = float(group["sign_momentum"])
-        sign_state_dtype = group["sign_state_dtype"]
         parameters: list[torch.Tensor] = []
         updates: list[torch.Tensor] = []
-        momentum_buffers: list[torch.Tensor] = []
 
         for parameter in group["params"]:
             gradient = parameter.grad
@@ -506,20 +417,6 @@ class STAC(Optimizer):
             update = -gradient if maximize else gradient
             parameters.append(parameter)
             updates.append(update)
-            if sign_momentum != 0.0:
-                state = self.state[parameter]
-                momentum_buffer = state.get("sign_momentum_buffer")
-                buffer_dtype = self._get_sign_state_dtype(
-                    parameter,
-                    sign_state_dtype,
-                )
-                if momentum_buffer is None:
-                    momentum_buffer = state["sign_momentum_buffer"] = torch.zeros_like(
-                        parameter,
-                        dtype=buffer_dtype,
-                        memory_format=torch.preserve_format,
-                    )
-                momentum_buffers.append(momentum_buffer)
 
         if not parameters:
             return
@@ -532,27 +429,7 @@ class STAC(Optimizer):
             if weight_decay != 0:
                 torch._foreach_mul_(parameters, 1 - lr * weight_decay)
 
-            if sign_momentum != 0.0:
-                buffer_updates = [
-                    update.to(dtype=momentum_buffer.dtype)
-                    if update.dtype != momentum_buffer.dtype
-                    else update
-                    for update, momentum_buffer in zip(
-                        updates,
-                        momentum_buffers,
-                        strict=True,
-                    )
-                ]
-                torch._foreach_mul_(momentum_buffers, sign_momentum)
-                torch._foreach_add_(
-                    momentum_buffers,
-                    buffer_updates,
-                    alpha=1 - sign_momentum,
-                )
-                directions = torch._foreach_sign(momentum_buffers)
-            else:
-                directions = torch._foreach_sign(updates)
-
+            directions = torch._foreach_sign(updates)
             directions = [
                 direction.to(dtype=parameter.dtype)
                 if direction.dtype != parameter.dtype
@@ -570,21 +447,7 @@ class STAC(Optimizer):
             if weight_decay != 0:
                 parameter.mul_(1 - lr * weight_decay)
 
-            if sign_momentum != 0.0:
-                momentum_buffer = momentum_buffers[index]
-                buffer_update = (
-                    updates[index].to(dtype=momentum_buffer.dtype)
-                    if updates[index].dtype != momentum_buffer.dtype
-                    else updates[index]
-                )
-                momentum_buffer.mul_(sign_momentum).add_(
-                    buffer_update,
-                    alpha=1 - sign_momentum,
-                )
-                direction = momentum_buffer.sign()
-            else:
-                direction = updates[index].sign()
-
+            direction = updates[index].sign()
             if direction.dtype != parameter.dtype:
                 direction = direction.to(dtype=parameter.dtype)
             parameter.add_(direction, alpha=-lr)
@@ -613,7 +476,7 @@ class STAC(Optimizer):
             update = -gradient if maximize else gradient
             state = self.state[parameter]
             if not state:
-                state["step"] = torch.zeros((), device=parameter.device)
+                state["step"] = torch.tensor(0.0)
                 state["exp_avg"] = torch.zeros_like(
                     parameter,
                     memory_format=torch.preserve_format,
@@ -630,7 +493,9 @@ class STAC(Optimizer):
 
             step = state["step"]
             if not isinstance(step, torch.Tensor):
-                step = state["step"] = torch.tensor(float(step), device=parameter.device)
+                step = state["step"] = torch.tensor(float(step))
+            elif step.device.type != "cpu":
+                step = state["step"] = step.detach().to(device="cpu")
 
             parameters.append(parameter)
             gradients.append(update)
@@ -761,6 +626,18 @@ class STAC(Optimizer):
                     )
                 return True
         return False
+
+    def _drop_legacy_sign_state(self) -> None:
+        for group in self.param_groups:
+            if group["stac_role"] != "sign":
+                continue
+            for parameter in group["params"]:
+                state = self.state.get(parameter)
+                if not isinstance(state, dict):
+                    continue
+                state.pop("sign_momentum_buffer", None)
+                if not state:
+                    self.state.pop(parameter, None)
 
     @staticmethod
     def _can_use_foreach(

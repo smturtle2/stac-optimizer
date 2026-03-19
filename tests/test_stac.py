@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import math
-import statistics
 
 import pytest
 import torch
@@ -41,19 +39,6 @@ class SparseNet(nn.Module):
         return self.head(embedded)
 
 
-class TinyBenchmarkNet(nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(16, 32)
-        self.fc2 = nn.Linear(32, 32)
-        self.head = nn.Linear(32, 4)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        inputs = torch.relu(self.fc1(inputs))
-        inputs = torch.relu(self.fc2(inputs))
-        return self.head(inputs)
-
-
 class RootOwnedNet(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -83,78 +68,6 @@ class ShapeShiftNet(nn.Module):
         super().__init__()
         self.base = nn.Linear(2, 1, bias=False)
         self.head = nn.Linear(1, 2, bias=False)
-
-
-def make_regression_batch(
-    seed: int,
-    *,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    inputs = torch.randn(384, 16, generator=generator)
-    target_matrix = torch.randn(16, 4, generator=generator)
-    targets = inputs @ target_matrix + 0.1 * torch.randn(
-        384,
-        4,
-        generator=generator,
-    )
-    return inputs.to(device), targets.to(device)
-
-
-def make_classification_batch(
-    seed: int,
-    *,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    generator = torch.Generator().manual_seed(seed)
-    inputs = torch.randn(768, 16, generator=generator)
-    class_matrix = torch.randn(16, 4, generator=generator)
-    logits = inputs @ class_matrix + 0.25 * torch.randn(
-        768,
-        4,
-        generator=generator,
-    )
-    targets = logits.argmax(dim=1)
-    return inputs.to(device), targets.to(device)
-
-
-def run_benchmark_trial(
-    seed: int,
-    *,
-    device: torch.device,
-    sign_momentum: float,
-    task_kind: str,
-) -> float:
-    if task_kind == "regression":
-        inputs, targets = make_regression_batch(seed, device=device)
-        loss_fn = torch.nn.functional.mse_loss
-    elif task_kind == "classification":
-        inputs, targets = make_classification_batch(seed, device=device)
-        loss_fn = torch.nn.functional.cross_entropy
-    else:
-        raise ValueError(f"Unknown task kind: {task_kind}.")
-
-    trial_seed = 1_234 + seed
-    torch.manual_seed(trial_seed)
-    if device.type == "cuda":
-        torch.cuda.manual_seed_all(trial_seed)
-    model = TinyBenchmarkNet().to(device)
-    optimizer = STAC(
-        model,
-        lr=3e-3,
-        last_n_modules=1,
-        sign_momentum=sign_momentum,
-        weight_decay=1e-2,
-    )
-
-    for _ in range(150):
-        optimizer.zero_grad(set_to_none=True)
-        predictions = model(inputs)
-        loss = loss_fn(predictions, targets)
-        loss.backward()
-        optimizer.step()
-
-    return float(loss.detach().cpu())
 
 
 @pytest.fixture(scope="module")
@@ -234,13 +147,13 @@ def test_last_n_larger_than_module_count_promotes_all_modules_to_adamw() -> None
     )
 
 
-def test_default_hybrid_sign_group_lr_is_scaled_down() -> None:
+def test_default_hybrid_sign_group_uses_shared_learning_rate() -> None:
     model = TwoLayerNet()
 
     optimizer = STAC(model, lr=0.1, last_n_modules=1)
 
     assert optimizer.param_groups[0]["stac_role"] == "sign"
-    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.075)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
     assert optimizer.param_groups[1]["stac_role"] == "adamw"
     assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
 
@@ -280,16 +193,6 @@ def test_last_n_modules_is_stored_on_optimizer() -> None:
     assert optimizer.partition.adamw_module_names == ("block.2", "head")
 
 
-def test_invalid_sign_state_dtype_is_rejected() -> None:
-    model = StackedNet()
-
-    with pytest.raises(ValueError, match="sign_state_dtype"):
-        STAC(model, sign_state_dtype=torch.int64)
-
-    with pytest.raises(ValueError, match="sign_state_dtype"):
-        STAC(model, sign_state_dtype="nope")
-
-
 def test_requires_at_least_one_trainable_parameter() -> None:
     model = StackedNet()
     for parameter in model.parameters():
@@ -311,7 +214,6 @@ def test_sign_section_uses_plain_signsgd_while_adamw_matches_adamw(
         model,
         lr=0.1,
         last_n_modules=1,
-        sign_momentum=0.0,
         betas=(0.9, 0.99),
         eps=1e-8,
         weight_decay=0.01,
@@ -327,7 +229,6 @@ def test_sign_section_uses_plain_signsgd_while_adamw_matches_adamw(
     )
 
     expected_sign = 1.0
-    expected_sign_lr = 0.1 * 0.75
     gradients = (0.2, 0.4)
     for gradient_value in gradients:
         model.base.weight.grad = torch.tensor([[gradient_value]], device=cuda_device)
@@ -342,8 +243,8 @@ def test_sign_section_uses_plain_signsgd_while_adamw_matches_adamw(
         optimizer.zero_grad(set_to_none=True)
         reference_optimizer.zero_grad(set_to_none=True)
 
-        expected_sign *= 1 - expected_sign_lr * 0.01
-        expected_sign -= expected_sign_lr * math.copysign(1.0, gradient_value)
+        expected_sign *= 1 - 0.1 * 0.01
+        expected_sign -= 0.1
 
     assert torch.allclose(
         model.base.weight.detach(),
@@ -357,39 +258,15 @@ def test_sign_section_uses_plain_signsgd_while_adamw_matches_adamw(
     )
 
 
-def test_sign_momentum_uses_sign_of_accumulated_gradient(
-    cuda_device: torch.device,
-) -> None:
+def test_sign_section_creates_no_optimizer_state(cuda_device: torch.device) -> None:
     model = TwoLayerNet().to(cuda_device)
-    with torch.no_grad():
-        model.base.weight.fill_(1.0)
-
-    optimizer = STAC(
-        model,
-        lr=0.1,
-        last_n_modules=1,
-        sign_momentum=0.5,
-        weight_decay=0.01,
-    )
+    optimizer = STAC(model, lr=0.1, last_n_modules=0)
 
     model.base.weight.grad = torch.tensor([[1.0]], device=cuda_device)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-
-    model.base.weight.grad = torch.tensor([[-0.1]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
     optimizer.step()
 
-    expected = 1.0
-    expected *= 1 - 0.075 * 0.01
-    expected -= 0.075
-    expected *= 1 - 0.075 * 0.01
-    expected -= 0.075
-
-    assert torch.allclose(
-        model.base.weight.detach(),
-        torch.tensor([[expected]], device=cuda_device),
-        atol=1e-6,
-    )
+    assert len(optimizer.state) == 0
 
 
 def test_role_specific_weight_decay_is_applied(
@@ -404,7 +281,6 @@ def test_role_specific_weight_decay_is_applied(
         model,
         lr=0.1,
         last_n_modules=1,
-        sign_momentum=0.0,
         sign_weight_decay=0.2,
         adamw_weight_decay=0.0,
     )
@@ -416,7 +292,7 @@ def test_role_specific_weight_decay_is_applied(
 
     assert torch.allclose(
         model.base.weight.detach(),
-        torch.tensor([[0.985]], device=cuda_device),
+        torch.tensor([[0.98]], device=cuda_device),
         atol=1e-6,
     )
     assert torch.allclose(
@@ -438,7 +314,6 @@ def test_state_dict_round_trip_preserves_optimizer_behavior(
         model_a,
         lr=0.1,
         last_n_modules=1,
-        sign_momentum=0.8,
         betas=(0.7, 0.9),
         weight_decay=0.01,
     )
@@ -446,7 +321,6 @@ def test_state_dict_round_trip_preserves_optimizer_behavior(
         model_b,
         lr=0.1,
         last_n_modules=1,
-        sign_momentum=0.8,
         betas=(0.7, 0.9),
         weight_decay=0.01,
     )
@@ -508,7 +382,6 @@ def test_maximize_reverses_update_direction(cuda_device: torch.device) -> None:
         model,
         lr=0.1,
         last_n_modules=0,
-        sign_momentum=0.0,
         maximize=True,
     )
 
@@ -565,55 +438,6 @@ def test_adamw_section_maximize_matches_torch_adamw(
         model.head.weight.detach(),
         reference_parameter.detach(),
         atol=1e-6,
-    )
-
-
-def test_sign_state_dtype_can_use_bfloat16(cuda_device: torch.device) -> None:
-    model = TwoLayerNet().to(cuda_device)
-    optimizer = STAC(
-        model,
-        lr=0.1,
-        last_n_modules=0,
-        sign_momentum=0.9,
-        sign_state_dtype=torch.bfloat16,
-    )
-
-    model.base.weight.grad = torch.tensor([[1.0]], device=cuda_device)
-    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
-    optimizer.step()
-
-    assert (
-        optimizer.state[model.base.weight]["sign_momentum_buffer"].dtype
-        == torch.bfloat16
-    )
-    assert (
-        optimizer.state[model.head.weight]["sign_momentum_buffer"].dtype
-        == torch.bfloat16
-    )
-
-
-def test_auto_sign_state_dtype_uses_fp32_for_bfloat16_parameters(
-    cuda_device: torch.device,
-) -> None:
-    model = TwoLayerNet().to(device=cuda_device, dtype=torch.bfloat16)
-    optimizer = STAC(
-        model,
-        lr=0.1,
-        last_n_modules=0,
-        sign_momentum=0.9,
-    )
-
-    model.base.weight.grad = torch.tensor([[1.0]], device=cuda_device).to(torch.bfloat16)
-    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device).to(torch.bfloat16)
-    optimizer.step()
-
-    assert (
-        optimizer.state[model.base.weight]["sign_momentum_buffer"].dtype
-        == torch.float32
-    )
-    assert (
-        optimizer.state[model.head.weight]["sign_momentum_buffer"].dtype
-        == torch.float32
     )
 
 
@@ -674,7 +498,6 @@ def test_foreach_true_matches_default_single_tensor_paths(
         default_model,
         lr=0.1,
         last_n_modules=1,
-        sign_momentum=0.8,
         betas=(0.9, 0.99),
         weight_decay=0.01,
         foreach=False,
@@ -683,7 +506,6 @@ def test_foreach_true_matches_default_single_tensor_paths(
         foreach_model,
         lr=0.1,
         last_n_modules=1,
-        sign_momentum=0.8,
         betas=(0.9, 0.99),
         weight_decay=0.01,
         foreach=True,
@@ -717,13 +539,13 @@ def test_foreach_true_matches_default_single_tensor_paths(
         atol=1e-6,
     )
     assert torch.allclose(
-        default_optimizer.state[default_model.base.weight]["sign_momentum_buffer"],
-        foreach_optimizer.state[foreach_model.base.weight]["sign_momentum_buffer"],
+        default_optimizer.state[default_model.head.weight]["exp_avg"],
+        foreach_optimizer.state[foreach_model.head.weight]["exp_avg"],
         atol=1e-6,
     )
     assert torch.allclose(
-        default_optimizer.state[default_model.head.weight]["exp_avg"],
-        foreach_optimizer.state[foreach_model.head.weight]["exp_avg"],
+        default_optimizer.state[default_model.head.weight]["exp_avg_sq"],
+        foreach_optimizer.state[foreach_model.head.weight]["exp_avg_sq"],
         atol=1e-6,
     )
 
@@ -840,28 +662,27 @@ def test_load_state_dict_rejects_parameter_name_mismatch(
         optimizer.load_state_dict(state_dict)
 
 
-@pytest.mark.parametrize("task_kind", ["regression", "classification"])
-def test_default_sign_momentum_is_more_effective_than_plain_sign_across_cuda_tasks(
-    cuda_device: torch.device,
-    task_kind: str,
-) -> None:
-    default_losses = [
-        run_benchmark_trial(
-            seed,
-            device=cuda_device,
-            sign_momentum=0.9,
-            task_kind=task_kind,
-        )
-        for seed in range(3)
-    ]
-    plain_losses = [
-        run_benchmark_trial(
-            seed,
-            device=cuda_device,
-            sign_momentum=0.0,
-            task_kind=task_kind,
-        )
-        for seed in range(3)
-    ]
+def test_load_state_dict_drops_legacy_sign_buffer(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
+    state_dict = deepcopy(optimizer.state_dict())
+    sign_group = state_dict["param_groups"][0]
+    sign_param_id = sign_group["params"][0]
+    state_dict["state"][sign_param_id] = {
+        "sign_momentum_buffer": torch.ones((1, 1), device=cuda_device),
+    }
 
-    assert statistics.fmean(default_losses) < statistics.fmean(plain_losses) * 0.75
+    optimizer.load_state_dict(state_dict)
+
+    assert model.base.weight not in optimizer.state
+
+
+def test_adamw_step_counter_stays_on_cpu(cuda_device: torch.device) -> None:
+    model = TwoLayerNet().to(cuda_device)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
+
+    model.base.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
+    optimizer.step()
+
+    assert optimizer.state[model.head.weight]["step"].device.type == "cpu"

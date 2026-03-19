@@ -5,43 +5,28 @@
 [![Torch >= 2.10](https://img.shields.io/badge/torch-%3E%3D2.10-ee4c2c)](https://pytorch.org/)
 [![CI](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml/badge.svg)](https://github.com/smturtle2/stac-optimizer/actions/workflows/workflow.yml)
 
-[Korean README](https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md) |
-[Optimizer docs](https://github.com/smturtle2/stac-optimizer/blob/main/docs/en/optimizer.md) |
-[Korean docs](https://github.com/smturtle2/stac-optimizer/blob/main/docs/ko/optimizer.md) |
-[Benchmark JSON](https://github.com/smturtle2/stac-optimizer/blob/main/docs/benchmark/research_benchmark.json)
+[Korean README](README.ko.md) |
+[Optimizer docs](docs/en/optimizer.md) |
+[Korean docs](docs/ko/optimizer.md) |
+[Benchmark JSON](docs/benchmark/research_benchmark.json)
 
-STAC keeps earlier trainable modules on momentum-stabilized sign updates and
-the last `N` trainable modules on AdamW. The target is practical: lower
-optimizer-state VRAM than full AdamW without giving up useful adaptivity on the
-final trainable modules.
+STAC keeps the last `N` trainable modules on AdamW and the earlier trainable
+modules on plain signSGD. The sign trunk has no momentum and no sign-side
+optimizer tensors, so optimizer-state VRAM stays far below full AdamW while
+the tail remains adaptive.
 
 | Item | Value |
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
 | Default split | last `1` trainable module uses AdamW |
-| Stability knobs | `sign_momentum`, `sign_lr_scale`, `error_if_nonfinite` |
-| VRAM knob | `sign_state_dtype="auto"` or `"bf16"` |
+| Sign trunk | plain signSGD, no momentum, no sign-side state |
+| Main tuning knobs | `last_n_modules`, `sign_lr_scale`, `foreach` |
 | Partition inspection | `optimizer.partition.sign_module_names`, `optimizer.partition.adamw_module_names` |
 
-## Layout
+## Flow
 
-```mermaid
-flowchart LR
-    A["Trainable modules in registration order"]
-    A --> B["Sign trunk"]
-    A --> C["AdamW cap"]
-    B --> D["Earlier modules<br/>decoupled weight decay<br/>sign of EMA(grad)<br/>1 state tensor"]
-    C --> E["Last N trainable modules<br/>standard AdamW<br/>2 state tensors"]
-
-    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
-    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
-    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
-
-    class A neutral;
-    class B,D sign;
-    class C,E adam;
-```
+![STAC optimizer flowchart](docs/assets/stac-flow.svg)
 
 ## Install
 
@@ -49,7 +34,7 @@ flowchart LR
 python -m pip install stac-optimizer
 ```
 
-For local development:
+For local development and benchmark generation:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -76,7 +61,7 @@ optimizer = STAC(
     model,
     lr=1e-3,
     last_n_modules=1,
-    sign_momentum=0.9,
+    sign_lr_scale=1.0,
     weight_decay=1e-2,
     error_if_nonfinite=True,
 )
@@ -97,35 +82,27 @@ print(optimizer.partition.adamw_module_names)
 Pure containers such as `nn.Sequential` are skipped unless they own parameters
 themselves.
 
-`sign_state_dtype="auto"` is the default. Switch to `"bf16"` on CUDA when you
-want a smaller sign-state footprint and the small precision trade-off is
-acceptable for your workload.
-
 ## CUDA Benchmark
 
-The repository benchmark uses separate train/validation splits, `5` paired
-seeds, per-trial model initialization matched across optimizers, epoch-by-epoch
-validation loss curves, and a first-step CUDA memory probe.
+The repository benchmark uses held-out validation splits, `5` paired seeds,
+deep residual models, epoch-by-epoch validation loss curves, and a first-step
+CUDA memory probe.
 
-![STAC CUDA research benchmark](https://raw.githubusercontent.com/smturtle2/stac-optimizer/main/docs/benchmark/research_benchmark.png)
+![STAC CUDA research benchmark](docs/benchmark/research_benchmark.png)
 
 Latest snapshot from `2026-03-19` on `torch 2.10.0+cu126` and
 `NVIDIA GeForce RTX 3070`:
 
-| Config | Regression val loss | Classification val loss | Classification val acc | Optimizer state MB |
-| --- | ---: | ---: | ---: | ---: |
-| `STAC` default (`last_n_modules=1`) | `0.045044` | `0.278679` | `0.9016` | `3.637` |
-| `STAC` wider AdamW section (`last_n_modules=2`) | `0.044285` | `0.281579` | `0.9039` | `3.762` |
-| `STAC` bf16 sign state | `0.045177` | `0.281705` | `0.9004` | `1.821` |
-| `AdamW` baseline | `0.043068` | `0.280832` | `0.9055` | `7.270` |
+| Config | Deep regression val loss | Deep classification val acc | TailNorm val acc | Optimizer state MB | Peak delta MB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `STAC` default (`last_n_modules=1`) | `0.016337` | `0.7037` | `0.7926` | `0.125` | `56.118` |
+| `STAC` wider AdamW cap (`last_n_modules=4`) | `0.015252` | `0.7092` | `0.8041` | `24.149` | `81.271` |
+| `AdamW` baseline | `0.013477` | `0.7207` | `0.8051` | `98.227` | `196.459` |
 
-In this run, the default STAC configuration used about half the optimizer state
-of AdamW, and the BF16 sign-state variant reduced that state again with only a
-small quality delta. Full methodology and all ablations live in the linked docs
-and JSON report.
-
-The figure also includes a LayerNorm-heavy classification stress task. Treat
-`last_n_modules` as a tuning knob, not a universal constant.
+In this run, the default STAC configuration cut optimizer state from
+`98.227 MB` to `0.125 MB` on the memory probe. A wider AdamW cap recovered
+more quality on the harder tasks, but still used much less state than full
+AdamW. Treat `last_n_modules` as a workload-dependent tuning knob.
 
 ## Verify
 

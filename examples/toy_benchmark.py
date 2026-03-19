@@ -23,9 +23,7 @@ class BenchmarkConfig:
     optimizer_kind: str
     lr: float = 3e-3
     last_n_modules: int = 1
-    sign_lr_scale: float = 0.75
-    sign_momentum: float = 0.9
-    sign_state_dtype: str | None = "auto"
+    sign_lr_scale: float = 1.0
     weight_decay: float = 1e-2
 
 
@@ -114,8 +112,6 @@ def build_optimizer(
             lr=config.lr,
             last_n_modules=config.last_n_modules,
             sign_lr_scale=config.sign_lr_scale,
-            sign_momentum=config.sign_momentum,
-            sign_state_dtype=config.sign_state_dtype,
             weight_decay=config.weight_decay,
         )
     if config.optimizer_kind == "adamw":
@@ -283,12 +279,12 @@ def main() -> None:
             optimizer_kind="stac",
         ),
         BenchmarkConfig(
-            label="STAC plain sign update",
+            label="STAC lower sign lr (sign_lr_scale=0.5)",
             optimizer_kind="stac",
-            sign_momentum=0.0,
+            sign_lr_scale=0.5,
         ),
         BenchmarkConfig(
-            label="STAC wider AdamW section (last_n_modules=2)",
+            label="STAC wider AdamW cap (last_n_modules=2)",
             optimizer_kind="stac",
             last_n_modules=2,
         ),
