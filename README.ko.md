@@ -2,8 +2,8 @@
 
 [English README](https://github.com/smturtle2/stac-optimizer/blob/main/README.md)
 
-앞쪽 학습 레이어는 momentum-stabilized sign 업데이트로, 마지막 `N`개 학습
-레이어는 AdamW로 유지하는 PyTorch 옵티마이저입니다. 목표는 전체를
+앞쪽 학습 모듈은 momentum-stabilized sign 업데이트로, 마지막 `N`개 학습
+모듈은 AdamW로 유지하는 PyTorch 옵티마이저입니다. 목표는 전체를
 AdamW로 돌릴 때보다 optimizer state VRAM을 줄이면서도, 적응형 업데이트가
 중요한 구간에서는 성능을 잃지 않는 것입니다.
 
@@ -11,7 +11,7 @@ AdamW로 돌릴 때보다 optimizer state VRAM을 줄이면서도, 적응형 업
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
-| 기본 분할 | 마지막 `1`개 학습 레이어만 AdamW |
+| 기본 분할 | 마지막 `1`개 학습 모듈만 AdamW |
 | sign 업데이트 구간 | decoupled weight decay + `sign(EMA(grad))` |
 | AdamW 구간 | AdamW + decoupled weight decay |
 | 추가 VRAM 옵션 | `sign_state_dtype=torch.bfloat16` |
@@ -21,8 +21,8 @@ AdamW로 돌릴 때보다 optimizer state VRAM을 줄이면서도, 적응형 업
 
 ```mermaid
 flowchart LR
-    A[등록 순서의 학습 레이어] --> B[앞쪽 학습 레이어]
-    A --> C[마지막 N개 학습 레이어]
+    A[등록 순서의 학습 모듈] --> B[앞쪽 학습 모듈]
+    A --> C[마지막 N개 학습 모듈]
     B --> D[sign 업데이트 구간<br/>decoupled weight decay<br/>EMA grad 후 sign update<br/>optional bf16 state]
     C --> E[AdamW 구간<br/>decoupled weight decay]
 ```
@@ -59,7 +59,7 @@ model = nn.Sequential(
 optimizer = STAC(
     model,
     lr=1e-3,
-    last_n_layers=1,
+    last_n_modules=1,
     sign_momentum=0.9,
     weight_decay=1e-2,
     sign_state_dtype=torch.bfloat16,
@@ -74,9 +74,13 @@ loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 
-print("sign layers:", optimizer.partition.sign_layer_names)
-print("adamw layers:", optimizer.partition.adamw_layer_names)
+print("sign modules:", optimizer.partition.sign_module_names)
+print("adamw modules:", optimizer.partition.adamw_module_names)
 ```
+
+`last_n_modules`는 trainable parameter를 직접 소유한 모듈만 셉니다.
+`nn.Sequential` 같은 순수 컨테이너는 자기 자신이 parameter를 직접 갖지 않으면
+자동으로 건너뜁니다.
 
 ## 설계 근거
 
@@ -120,8 +124,8 @@ JSON 결과:
 
 | 옵티마이저 | 최종 val loss 평균 | 최종 val loss 범위 |
 | --- | ---: | ---: |
-| `STAC` 기본 (`last_n_layers=1`) | `0.046044` | `0.044386 - 0.047686` |
-| `STAC` AdamW 구간 확장 (`last_n_layers=2`) | `0.044885` | `0.044014 - 0.046273` |
+| `STAC` 기본 (`last_n_modules=1`) | `0.045901` | `0.044386 - 0.047512` |
+| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `0.044885` | `0.044014 - 0.046273` |
 | `STAC` plain sign update | `0.043162` | `0.041903 - 0.044614` |
 | `AdamW` baseline | `0.043753` | `0.042771 - 0.045108` |
 
@@ -129,8 +133,8 @@ JSON 결과:
 
 | 옵티마이저 | 최종 val loss 평균 | 최종 val loss 범위 | 최종 val acc 평균 |
 | --- | ---: | ---: | ---: |
-| `STAC` 기본 (`last_n_layers=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
-| `STAC` AdamW 구간 확장 (`last_n_layers=2`) | `0.311801` | `0.285143 - 0.320327` | `0.8918` |
+| `STAC` 기본 (`last_n_modules=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
+| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `0.311801` | `0.285143 - 0.320327` | `0.8918` |
 | `STAC` plain sign update | `0.314426` | `0.279694 - 0.330161` | `0.9039` |
 | `AdamW` baseline | `0.304733` | `0.275815 - 0.317797` | `0.9074` |
 
@@ -138,8 +142,8 @@ JSON 결과:
 
 | 옵티마이저 | Optimizer state MB | Peak allocated MB | Peak reserved MB |
 | --- | ---: | ---: | ---: |
-| `STAC` 기본 (`last_n_layers=1`) | `3.637` | `31.925` | `38.000` |
-| `STAC` AdamW 구간 확장 (`last_n_layers=2`) | `3.762` | `31.674` | `38.000` |
+| `STAC` 기본 (`last_n_modules=1`) | `3.637` | `31.925` | `38.000` |
+| `STAC` AdamW 구간 확장 (`last_n_modules=2`) | `3.762` | `31.674` | `38.000` |
 | `STAC` plain sign update | `0.004` | `28.292` | `34.000` |
 | `AdamW` baseline | `7.270` | `35.565` | `40.000` |
 
@@ -154,16 +158,16 @@ JSON 결과:
 패키지는 다음을 export합니다.
 
 - `STAC`
-- `partition_trainable_layers(model, last_n_layers=1)`
-- `LayerGroup`
+- `partition_trainable_modules(model, last_n_modules=1)`
+- `ModuleGroup`
 - `STACPartition`
 
 실사용에서 중요한 보장:
 
-- `model.named_modules()` 기준의 결정적 sign/AdamW 분할
+- `model.named_modules()`에서 trainable parameter를 직접 가진 모듈 기준의 결정적 sign/AdamW 분할
 - sparse gradient 명시적 거부
 - `error_if_nonfinite=False`일 때 non-finite dense gradient step 전체 skip
-- state_dict 로드 시 layer name, parameter name, state tensor shape 검증
+- state_dict 로드 시 module name, parameter name, state tensor shape 검증
 
 ## 검증
 

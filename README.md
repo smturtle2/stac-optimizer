@@ -7,8 +7,8 @@
 
 [한국어 README](https://github.com/smturtle2/stac-optimizer/blob/main/README.ko.md)
 
-It is a PyTorch optimizer that keeps the earlier trainable layers on a
-momentum-stabilized sign updates and the last `N` trainable layers on AdamW.
+It is a PyTorch optimizer that keeps the earlier trainable modules on
+momentum-stabilized sign updates and the last `N` trainable modules on AdamW.
 The goal is simple: keep optimizer-state VRAM lower than full AdamW while
 preserving strong optimization behavior where adaptive updates matter most.
 
@@ -16,7 +16,7 @@ preserving strong optimization behavior where adaptive updates matter most.
 | --- | --- |
 | Python | `>=3.13` |
 | PyTorch | `>=2.10` |
-| Default split | last `1` trainable layer uses AdamW |
+| Default split | last `1` trainable module uses AdamW |
 | Sign-updated section | decoupled weight decay + `sign(EMA(grad))` |
 | AdamW section | AdamW with decoupled weight decay |
 | Extra VRAM knob | `sign_state_dtype=torch.bfloat16` |
@@ -26,8 +26,8 @@ preserving strong optimization behavior where adaptive updates matter most.
 
 ```mermaid
 flowchart LR
-    A[Trainable layers in registration order] --> B[Earlier trainable layers]
-    A --> C[Last N trainable layers]
+    A[Trainable modules in registration order] --> B[Earlier trainable modules]
+    A --> C[Last N trainable modules]
     B --> D[Sign-updated section<br/>decoupled weight decay<br/>EMA grad then sign update<br/>optional bf16 state]
     C --> E[AdamW section<br/>decoupled weight decay]
 ```
@@ -64,7 +64,7 @@ model = nn.Sequential(
 optimizer = STAC(
     model,
     lr=1e-3,
-    last_n_layers=1,
+    last_n_modules=1,
     sign_momentum=0.9,
     weight_decay=1e-2,
     sign_state_dtype=torch.bfloat16,
@@ -79,9 +79,13 @@ loss.backward()
 optimizer.step()
 optimizer.zero_grad(set_to_none=True)
 
-print("sign layers:", optimizer.partition.sign_layer_names)
-print("adamw layers:", optimizer.partition.adamw_layer_names)
+print("sign modules:", optimizer.partition.sign_module_names)
+print("adamw modules:", optimizer.partition.adamw_module_names)
 ```
+
+`last_n_modules` counts modules that directly own trainable parameters. Pure
+containers such as `nn.Sequential` are skipped unless they own parameters
+themselves.
 
 ## Why This Design
 
@@ -126,8 +130,8 @@ Regression validation loss:
 
 | Optimizer | Final val loss mean | Final val loss range |
 | --- | ---: | ---: |
-| `STAC` default (`last_n_layers=1`) | `0.046044` | `0.044386 - 0.047686` |
-| `STAC` wider AdamW section (`last_n_layers=2`) | `0.044885` | `0.044014 - 0.046273` |
+| `STAC` default (`last_n_modules=1`) | `0.045901` | `0.044386 - 0.047512` |
+| `STAC` wider AdamW section (`last_n_modules=2`) | `0.044885` | `0.044014 - 0.046273` |
 | `STAC` plain sign update | `0.043162` | `0.041903 - 0.044614` |
 | `AdamW` baseline | `0.043753` | `0.042771 - 0.045108` |
 
@@ -135,8 +139,8 @@ Classification validation:
 
 | Optimizer | Final val loss mean | Final val loss range | Final val acc mean |
 | --- | ---: | ---: | ---: |
-| `STAC` default (`last_n_layers=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
-| `STAC` wider AdamW section (`last_n_layers=2`) | `0.311801` | `0.285143 - 0.320327` | `0.8918` |
+| `STAC` default (`last_n_modules=1`) | `0.303325` | `0.252935 - 0.333419` | `0.8926` |
+| `STAC` wider AdamW section (`last_n_modules=2`) | `0.311801` | `0.285143 - 0.320327` | `0.8918` |
 | `STAC` plain sign update | `0.314426` | `0.279694 - 0.330161` | `0.9039` |
 | `AdamW` baseline | `0.304733` | `0.275815 - 0.317797` | `0.9074` |
 
@@ -144,8 +148,8 @@ Memory probe:
 
 | Optimizer | Optimizer state MB | Peak allocated MB | Peak reserved MB |
 | --- | ---: | ---: | ---: |
-| `STAC` default (`last_n_layers=1`) | `3.637` | `31.925` | `38.000` |
-| `STAC` wider AdamW section (`last_n_layers=2`) | `3.762` | `31.674` | `38.000` |
+| `STAC` default (`last_n_modules=1`) | `3.637` | `31.925` | `38.000` |
+| `STAC` wider AdamW section (`last_n_modules=2`) | `3.762` | `31.674` | `38.000` |
 | `STAC` plain sign update | `0.004` | `28.292` | `34.000` |
 | `AdamW` baseline | `7.270` | `35.565` | `40.000` |
 
@@ -160,17 +164,17 @@ two practical questions for this repository:
 The package exports:
 
 - `STAC`
-- `partition_trainable_layers(model, last_n_layers=1)`
-- `LayerGroup`
+- `partition_trainable_modules(model, last_n_modules=1)`
+- `ModuleGroup`
 - `STACPartition`
 
 Useful runtime guarantees:
 
-- deterministic sign/AdamW partitioning based on `model.named_modules()`
+- deterministic sign/AdamW partitioning based on direct trainable modules in `model.named_modules()`
 - explicit rejection of sparse gradients
 - whole-step skip on non-finite dense gradients unless
   `error_if_nonfinite=True`
-- checkpoint validation against saved layer names, parameter names, and state
+- checkpoint validation against saved module names, parameter names, and state
   tensor shapes
 
 ## Verification

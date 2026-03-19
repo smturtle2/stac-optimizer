@@ -73,8 +73,8 @@ jobs:
               nn.ReLU(),
               nn.Linear(4, 2),
           )
-          optimizer = STAC(model, last_n_layers=1)
-          assert optimizer.partition.adamw_layer_names == ("2",)
+          optimizer = STAC(model, last_n_modules=1)
+          assert optimizer.partition.adamw_module_names == ("2",)
           PY
 
   release:

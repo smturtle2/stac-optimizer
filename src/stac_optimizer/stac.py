@@ -23,13 +23,13 @@ _SIGN_STATE_DTYPE_ALIASES = {
 
 
 @dataclass(frozen=True)
-class LayerGroup:
-    """One trainable module slice discovered by :func:`partition_trainable_layers`.
+class ModuleGroup:
+    """One trainable module slice discovered by :func:`partition_trainable_modules`.
 
     Attributes:
         name: Module path in ``model.named_modules()`` order. Root-owned parameters
             use ``"<root>"``.
-        parameter_names: Fully-qualified parameter names that belong to the layer.
+        parameter_names: Fully-qualified parameter names that belong to the module.
         parameters: Trainable parameters owned directly by that module.
     """
 
@@ -40,33 +40,33 @@ class LayerGroup:
 
 @dataclass(frozen=True)
 class STACPartition:
-    """Deterministic split of trainable layers into sign and AdamW sections.
+    """Deterministic split of trainable modules into sign and AdamW sections.
 
-    The partition preserves trainable layer order from
+    The partition preserves trainable module order from
     :func:`torch.nn.Module.named_modules`, which makes the split stable across
     repeated construction for the same model definition.
     """
 
-    sign_layers: tuple[LayerGroup, ...]
-    adamw_layers: tuple[LayerGroup, ...]
+    sign_modules: tuple[ModuleGroup, ...]
+    adamw_modules: tuple[ModuleGroup, ...]
 
     @property
-    def sign_layer_names(self) -> tuple[str, ...]:
-        """Names of trainable layers updated by the sign-based section."""
-        return tuple(layer.name for layer in self.sign_layers)
+    def sign_module_names(self) -> tuple[str, ...]:
+        """Names of trainable modules updated by the sign-based section."""
+        return tuple(module.name for module in self.sign_modules)
 
     @property
-    def adamw_layer_names(self) -> tuple[str, ...]:
-        """Names of trainable layers updated by the AdamW section."""
-        return tuple(layer.name for layer in self.adamw_layers)
+    def adamw_module_names(self) -> tuple[str, ...]:
+        """Names of trainable modules updated by the AdamW section."""
+        return tuple(module.name for module in self.adamw_modules)
 
     @property
     def sign_parameter_names(self) -> tuple[str, ...]:
         """Flattened parameter names that belong to the sign-based section."""
         return tuple(
             parameter_name
-            for layer in self.sign_layers
-            for parameter_name in layer.parameter_names
+            for module in self.sign_modules
+            for parameter_name in module.parameter_names
         )
 
     @property
@@ -74,8 +74,8 @@ class STACPartition:
         """Flattened parameter names that belong to the AdamW section."""
         return tuple(
             parameter_name
-            for layer in self.adamw_layers
-            for parameter_name in layer.parameter_names
+            for module in self.adamw_modules
+            for parameter_name in module.parameter_names
         )
 
     @property
@@ -83,8 +83,8 @@ class STACPartition:
         """Flattened trainable parameters that belong to the sign-based section."""
         return tuple(
             parameter
-            for layer in self.sign_layers
-            for parameter in layer.parameters
+            for module in self.sign_modules
+            for parameter in module.parameters
         )
 
     @property
@@ -92,41 +92,42 @@ class STACPartition:
         """Flattened trainable parameters that belong to the AdamW section."""
         return tuple(
             parameter
-            for layer in self.adamw_layers
-            for parameter in layer.parameters
+            for module in self.adamw_modules
+            for parameter in module.parameters
         )
 
 
-def partition_trainable_layers(
+def partition_trainable_modules(
     model: nn.Module,
     *,
-    last_n_layers: int = 1,
+    last_n_modules: int = 1,
 ) -> STACPartition:
-    """Split a model into sign and AdamW sections by trainable layer order.
+    """Split a model into sign and AdamW sections by trainable module order.
 
     STAC walks ``model.named_modules()`` in registration order and treats each
-    module that owns trainable parameters directly as one layer. The final
-    ``last_n_layers`` layers become the AdamW section; everything before that
+    module that owns trainable parameters directly as one counted module. The
+    final ``last_n_modules`` counted modules become the AdamW section;
+    everything before that
     stays in the sign-based section.
 
     Args:
         model: Module whose trainable parameters should be partitioned.
-        last_n_layers: Number of final trainable layers that should use AdamW.
+        last_n_modules: Number of final trainable modules that should use AdamW.
 
     Returns:
-        A deterministic partition describing which layers belong to the sign
+        A deterministic partition describing which modules belong to the sign
         section and which belong to the AdamW section.
 
     Raises:
-        ValueError: If ``last_n_layers`` is negative or the model has no
+        ValueError: If ``last_n_modules`` is negative or the model has no
             trainable parameters.
     """
 
-    if last_n_layers < 0:
-        raise ValueError("last_n_layers must be greater than or equal to 0.")
+    if last_n_modules < 0:
+        raise ValueError("last_n_modules must be greater than or equal to 0.")
 
     seen_parameters: set[int] = set()
-    layer_groups: list[LayerGroup] = []
+    module_groups: list[ModuleGroup] = []
 
     for module_name, module in model.named_modules():
         parameter_entries: list[tuple[str, nn.Parameter]] = []
@@ -146,34 +147,40 @@ def partition_trainable_layers(
 
         if parameter_entries:
             names, parameters = zip(*parameter_entries)
-            layer_groups.append(
-                LayerGroup(
+            module_groups.append(
+                ModuleGroup(
                     name=module_name or "<root>",
                     parameter_names=tuple(names),
                     parameters=tuple(parameters),
                 )
             )
 
-    if not layer_groups:
+    if not module_groups:
         raise ValueError("STAC requires at least one trainable parameter.")
 
-    sign_count = max(len(layer_groups) - last_n_layers, 0)
+    sign_count = max(len(module_groups) - last_n_modules, 0)
     return STACPartition(
-        sign_layers=tuple(layer_groups[:sign_count]),
-        adamw_layers=tuple(layer_groups[sign_count:]),
+        sign_modules=tuple(module_groups[:sign_count]),
+        adamw_modules=tuple(module_groups[sign_count:]),
     )
 
 
 class STAC(Optimizer):
-    r"""SignSGD section with an AdamW section over the last N trainable layers.
+    r"""SignSGD section with an AdamW section over the last N trainable modules.
 
-    Layer discovery is deterministic: STAC walks ``model.named_modules()`` in
+    Module discovery is deterministic: STAC walks ``model.named_modules()`` in
     registration order and treats each module that owns trainable parameters
-    directly (``recurse=False``) as one layer. The final ``last_n_layers`` of
-    that ordered list use AdamW, while all earlier layers use a sign-based
-    update. By default the sign-based section accumulates gradients with momentum
-    before taking the sign, which is markedly more stable than plain signSGD.
-    Set ``sign_momentum=0.0`` to recover textbook signSGD.
+    directly (``recurse=False``) as one counted module. The final
+    ``last_n_modules`` of that ordered list use AdamW, while all earlier
+    modules use a sign-based update. By default the sign-based section
+    accumulates gradients with momentum before taking the sign, which is
+    markedly more stable than plain signSGD. Set ``sign_momentum=0.0`` to
+    recover textbook signSGD.
+
+    Pure containers such as ``nn.Sequential`` are skipped unless they own
+    trainable parameters themselves. In practice this means the counted modules
+    are usually the parameterized end modules users care about, such as
+    ``stem``, ``block.0``, ``block.2``, and ``head``.
 
     When both sections are active, STAC internally uses ``0.75 * lr`` for the
     sign-based section and ``lr`` for the AdamW section. This keeps the sign
@@ -201,7 +208,7 @@ class STAC(Optimizer):
         model: nn.Module,
         *,
         lr: float = 1e-3,
-        last_n_layers: int = 1,
+        last_n_modules: int = 1,
         sign_momentum: float = 0.9,
         sign_state_dtype: torch.dtype | str | None = None,
         betas: tuple[float, float] = (0.9, 0.999),
@@ -220,8 +227,8 @@ class STAC(Optimizer):
             lr: Shared base learning rate. In hybrid mode, STAC internally uses
                 ``0.75 * lr`` for the sign-based section and ``lr`` for the
                 AdamW section.
-            last_n_layers: Number of final trainable layers that should use
-                AdamW. Earlier trainable layers use the sign-based section.
+            last_n_modules: Number of final trainable modules that should use
+                AdamW. Earlier trainable modules use the sign-based section.
             sign_momentum: EMA factor applied before taking the sign in the
                 sign-based section. Set ``0.0`` to recover plain signSGD.
             sign_state_dtype: Optional floating dtype used for the sign-section
@@ -257,13 +264,13 @@ class STAC(Optimizer):
             sign_state_dtype
         )
 
-        partition = partition_trainable_layers(
+        partition = partition_trainable_modules(
             model,
-            last_n_layers=last_n_layers,
+            last_n_modules=last_n_modules,
         )
         default_sign_lr = (
             lr * _HYBRID_SIGN_LR_SCALE
-            if partition.sign_layers and partition.adamw_layers
+            if partition.sign_modules and partition.adamw_modules
             else lr
         )
         sign_weight_decay = (
@@ -277,16 +284,16 @@ class STAC(Optimizer):
         self._validate_nonnegative("adamw_weight_decay", adamw_weight_decay)
 
         self.partition = partition
-        self.last_n_layers = last_n_layers
+        self.last_n_modules = last_n_modules
         self.nonfinite_skipped_steps = 0
 
         param_groups: list[dict[str, object]] = []
-        if self.partition.sign_layers:
+        if self.partition.sign_modules:
             param_groups.append(
                 {
                     "params": list(self.partition.sign_parameters),
                     "stac_role": "sign",
-                    "layer_names": self.partition.sign_layer_names,
+                    "module_names": self.partition.sign_module_names,
                     "param_names": self.partition.sign_parameter_names,
                     "lr": default_sign_lr,
                     "weight_decay": sign_weight_decay,
@@ -294,12 +301,12 @@ class STAC(Optimizer):
                     "sign_state_dtype": resolved_sign_state_dtype,
                 }
             )
-        if self.partition.adamw_layers:
+        if self.partition.adamw_modules:
             param_groups.append(
                 {
                     "params": list(self.partition.adamw_parameters),
                     "stac_role": "adamw",
-                    "layer_names": self.partition.adamw_layer_names,
+                    "module_names": self.partition.adamw_module_names,
                     "param_names": self.partition.adamw_parameter_names,
                     "lr": lr,
                     "weight_decay": adamw_weight_decay,
@@ -377,7 +384,7 @@ class STAC(Optimizer):
         for group in self.param_groups:
             group.setdefault("maximize", False)
             group.setdefault("stac_role", "sign")
-            group.setdefault("layer_names", ())
+            group.setdefault("module_names", ())
             group.setdefault("param_names", ())
             group.setdefault("sign_momentum", 0.0)
             group.setdefault("sign_state_dtype", None)
@@ -655,13 +662,13 @@ class STAC(Optimizer):
                     param_index=param_index,
                 )
 
-            saved_layer_names = tuple(saved_group.get("layer_names", ()))
-            current_layer_names = tuple(current_group.get("layer_names", ()))
-            if saved_layer_names and saved_layer_names != current_layer_names:
+            saved_module_names = tuple(saved_group.get("module_names", ()))
+            current_module_names = tuple(current_group.get("module_names", ()))
+            if saved_module_names and saved_module_names != current_module_names:
                 raise ValueError(
-                    "Saved STAC state was created for different trainable layers: "
-                    f"group {index} checkpoint layers {saved_layer_names!r} do not "
-                    f"match current layers {current_layer_names!r}."
+                    "Saved STAC state was created for different trainable modules: "
+                    f"group {index} checkpoint modules {saved_module_names!r} do not "
+                    f"match current modules {current_module_names!r}."
                 )
 
             saved_param_names = tuple(saved_group.get("param_names", ()))

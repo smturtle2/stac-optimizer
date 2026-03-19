@@ -1,8 +1,13 @@
-from .stac import LayerGroup, STAC, STACPartition, partition_trainable_layers
+from .stac import (
+    ModuleGroup,
+    STAC,
+    STACPartition,
+    partition_trainable_modules,
+)
 
 __all__ = [
-    "LayerGroup",
+    "ModuleGroup",
     "STAC",
     "STACPartition",
-    "partition_trainable_layers",
+    "partition_trainable_modules",
 ]

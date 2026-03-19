@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from stac_optimizer import STAC, partition_trainable_layers
+from stac_optimizer import STAC, partition_trainable_modules
 
 
 class StackedNet(nn.Module):
@@ -139,7 +139,7 @@ def run_benchmark_trial(
     optimizer = STAC(
         model,
         lr=3e-3,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=sign_momentum,
         weight_decay=1e-2,
     )
@@ -161,54 +161,54 @@ def cuda_device() -> torch.device:
     return torch.device("cuda")
 
 
-def test_partition_defaults_to_last_trainable_layer() -> None:
+def test_partition_defaults_to_last_trainable_module() -> None:
     model = StackedNet()
 
-    partition = partition_trainable_layers(model)
+    partition = partition_trainable_modules(model)
 
-    assert partition.sign_layer_names == ("stem", "block.0", "block.2")
-    assert partition.adamw_layer_names == ("head",)
+    assert partition.sign_module_names == ("stem", "block.0", "block.2")
+    assert partition.adamw_module_names == ("head",)
 
 
-def test_partition_skips_frozen_layers_when_counting_last_n() -> None:
+def test_partition_skips_frozen_modules_when_counting_last_n() -> None:
     model = StackedNet()
     for parameter in model.head.parameters():
         parameter.requires_grad = False
 
-    partition = partition_trainable_layers(model, last_n_layers=1)
+    partition = partition_trainable_modules(model, last_n_modules=1)
 
-    assert partition.sign_layer_names == ("stem", "block.0")
-    assert partition.adamw_layer_names == ("block.2",)
+    assert partition.sign_module_names == ("stem", "block.0")
+    assert partition.adamw_module_names == ("block.2",)
 
 
 def test_partition_exposes_root_owned_parameters() -> None:
     model = RootOwnedNet()
 
-    partition = partition_trainable_layers(model, last_n_layers=1)
+    partition = partition_trainable_modules(model, last_n_modules=1)
 
-    assert partition.sign_layer_names == ("<root>",)
+    assert partition.sign_module_names == ("<root>",)
     assert partition.sign_parameter_names == ("root_scale",)
-    assert partition.adamw_layer_names == ("head",)
+    assert partition.adamw_module_names == ("head",)
     assert partition.adamw_parameter_names == ("head.weight",)
 
 
 def test_partition_assigns_shared_parameters_to_first_owner() -> None:
     model = SharedParameterNet()
 
-    partition = partition_trainable_layers(model, last_n_layers=0)
+    partition = partition_trainable_modules(model, last_n_modules=0)
 
-    assert partition.sign_layer_names == ("first",)
+    assert partition.sign_module_names == ("first",)
     assert partition.sign_parameter_names == ("first.weight",)
 
 
-def test_last_n_zero_keeps_all_layers_in_sign_section() -> None:
+def test_last_n_zero_keeps_all_modules_in_sign_section() -> None:
     model = StackedNet()
 
-    optimizer = STAC(model, lr=1e-3, last_n_layers=0)
+    optimizer = STAC(model, lr=1e-3, last_n_modules=0)
 
     assert [group["stac_role"] for group in optimizer.param_groups] == ["sign"]
-    assert optimizer.partition.adamw_layer_names == ()
-    assert optimizer.partition.sign_layer_names == (
+    assert optimizer.partition.adamw_module_names == ()
+    assert optimizer.partition.sign_module_names == (
         "stem",
         "block.0",
         "block.2",
@@ -216,14 +216,14 @@ def test_last_n_zero_keeps_all_layers_in_sign_section() -> None:
     )
 
 
-def test_last_n_larger_than_layer_count_promotes_all_layers_to_adamw() -> None:
+def test_last_n_larger_than_module_count_promotes_all_modules_to_adamw() -> None:
     model = StackedNet()
 
-    optimizer = STAC(model, lr=1e-3, last_n_layers=99)
+    optimizer = STAC(model, lr=1e-3, last_n_modules=99)
 
     assert [group["stac_role"] for group in optimizer.param_groups] == ["adamw"]
-    assert optimizer.partition.sign_layer_names == ()
-    assert optimizer.partition.adamw_layer_names == (
+    assert optimizer.partition.sign_module_names == ()
+    assert optimizer.partition.adamw_module_names == (
         "stem",
         "block.0",
         "block.2",
@@ -234,7 +234,7 @@ def test_last_n_larger_than_layer_count_promotes_all_layers_to_adamw() -> None:
 def test_default_hybrid_sign_group_lr_is_scaled_down() -> None:
     model = TwoLayerNet()
 
-    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
 
     assert optimizer.param_groups[0]["stac_role"] == "sign"
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.075)
@@ -242,11 +242,21 @@ def test_default_hybrid_sign_group_lr_is_scaled_down() -> None:
     assert optimizer.param_groups[1]["lr"] == pytest.approx(0.1)
 
 
-def test_negative_last_n_layers_is_rejected() -> None:
+def test_negative_last_n_modules_is_rejected() -> None:
     model = StackedNet()
 
-    with pytest.raises(ValueError, match="last_n_layers"):
-        STAC(model, last_n_layers=-1)
+    with pytest.raises(ValueError, match="last_n_modules"):
+        STAC(model, last_n_modules=-1)
+
+
+def test_last_n_modules_is_stored_on_optimizer() -> None:
+    model = StackedNet()
+
+    optimizer = STAC(model, last_n_modules=2)
+
+    assert optimizer.last_n_modules == 2
+    assert optimizer.partition.sign_module_names == ("stem", "block.0")
+    assert optimizer.partition.adamw_module_names == ("block.2", "head")
 
 
 def test_invalid_sign_state_dtype_is_rejected() -> None:
@@ -279,7 +289,7 @@ def test_sign_section_uses_plain_signsgd_while_adamw_matches_adamw(
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=0.0,
         betas=(0.9, 0.99),
         eps=1e-8,
@@ -336,7 +346,7 @@ def test_sign_momentum_uses_sign_of_accumulated_gradient(
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=0.5,
         weight_decay=0.01,
     )
@@ -372,7 +382,7 @@ def test_role_specific_weight_decay_is_applied(
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=0.0,
         sign_weight_decay=0.2,
         adamw_weight_decay=0.0,
@@ -406,7 +416,7 @@ def test_state_dict_round_trip_preserves_optimizer_behavior(
     optimizer_a = STAC(
         model_a,
         lr=0.1,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=0.8,
         betas=(0.7, 0.9),
         weight_decay=0.01,
@@ -414,7 +424,7 @@ def test_state_dict_round_trip_preserves_optimizer_behavior(
     optimizer_b = STAC(
         model_b,
         lr=0.1,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=0.8,
         betas=(0.7, 0.9),
         weight_decay=0.01,
@@ -449,7 +459,7 @@ def test_state_dict_round_trip_preserves_optimizer_behavior(
 
 def test_step_supports_closure(cuda_device: torch.device) -> None:
     model = TwoLayerNet().to(cuda_device)
-    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
     inputs = torch.ones((1, 1), device=cuda_device)
     targets = torch.zeros((1, 1), device=cuda_device)
 
@@ -476,7 +486,7 @@ def test_maximize_reverses_update_direction(cuda_device: torch.device) -> None:
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=0,
+        last_n_modules=0,
         sign_momentum=0.0,
         maximize=True,
     )
@@ -501,7 +511,7 @@ def test_adamw_section_maximize_matches_torch_adamw(
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=2,
+        last_n_modules=2,
         betas=(0.9, 0.99),
         eps=1e-8,
         weight_decay=0.01,
@@ -542,7 +552,7 @@ def test_sign_state_dtype_can_use_bfloat16(cuda_device: torch.device) -> None:
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=0,
+        last_n_modules=0,
         sign_momentum=0.9,
         sign_state_dtype=torch.bfloat16,
     )
@@ -570,7 +580,7 @@ def test_amsgrad_adamw_section_matches_torch_adamw(cuda_device: torch.device) ->
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=2,
+        last_n_modules=2,
         betas=(0.9, 0.99),
         eps=1e-8,
         weight_decay=0.01,
@@ -621,7 +631,7 @@ def test_sparse_gradients_are_rejected_in_both_sections(
     indices = torch.tensor([[0, 1], [2, 3]], device=cuda_device)
 
     sign_model = SparseNet().to(cuda_device)
-    sign_optimizer = STAC(sign_model, lr=0.1, last_n_layers=1)
+    sign_optimizer = STAC(sign_model, lr=0.1, last_n_modules=1)
     sign_loss = sign_model(indices).sum()
     sign_loss.backward()
 
@@ -629,7 +639,7 @@ def test_sparse_gradients_are_rejected_in_both_sections(
         sign_optimizer.step()
 
     adamw_model = SparseNet().to(cuda_device)
-    adamw_optimizer = STAC(adamw_model, lr=0.1, last_n_layers=2)
+    adamw_optimizer = STAC(adamw_model, lr=0.1, last_n_modules=2)
     adamw_loss = adamw_model(indices).sum()
     adamw_loss.backward()
 
@@ -642,7 +652,7 @@ def test_nonfinite_gradients_can_raise(cuda_device: torch.device) -> None:
     optimizer = STAC(
         model,
         lr=0.1,
-        last_n_layers=1,
+        last_n_modules=1,
         error_if_nonfinite=True,
     )
 
@@ -661,7 +671,7 @@ def test_nonfinite_gradients_skip_the_entire_step_by_default(
         model.base.weight.fill_(1.0)
         model.head.weight.fill_(1.0)
 
-    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
     model.base.weight.grad = torch.tensor([[float("nan")]], device=cuda_device)
     model.head.weight.grad = torch.tensor([[1.0]], device=cuda_device)
 
@@ -685,8 +695,8 @@ def test_load_state_dict_rejects_partition_mismatch(
     cuda_device: torch.device,
 ) -> None:
     model = TwoLayerNet().to(cuda_device)
-    stateful_optimizer = STAC(model, lr=0.1, last_n_layers=1)
-    mismatched_optimizer = STAC(model, lr=0.1, last_n_layers=0)
+    stateful_optimizer = STAC(model, lr=0.1, last_n_modules=1)
+    mismatched_optimizer = STAC(model, lr=0.1, last_n_modules=0)
 
     with pytest.raises(ValueError, match="parameter groups"):
         mismatched_optimizer.load_state_dict(stateful_optimizer.state_dict())
@@ -694,13 +704,13 @@ def test_load_state_dict_rejects_partition_mismatch(
 
 def test_load_state_dict_rejects_parameter_shape_mismatch() -> None:
     source_model = TwoLayerNet()
-    source_optimizer = STAC(source_model, lr=0.1, last_n_layers=1)
+    source_optimizer = STAC(source_model, lr=0.1, last_n_modules=1)
     source_model.base.weight.grad = torch.tensor([[1.0]])
     source_model.head.weight.grad = torch.tensor([[1.0]])
     source_optimizer.step()
 
     mismatched_model = ShapeShiftNet()
-    mismatched_optimizer = STAC(mismatched_model, lr=0.1, last_n_layers=1)
+    mismatched_optimizer = STAC(mismatched_model, lr=0.1, last_n_modules=1)
 
     with pytest.raises(ValueError, match="parameter shapes"):
         mismatched_optimizer.load_state_dict(deepcopy(source_optimizer.state_dict()))
@@ -710,7 +720,7 @@ def test_load_state_dict_rejects_parameter_name_mismatch(
     cuda_device: torch.device,
 ) -> None:
     model = TwoLayerNet().to(cuda_device)
-    optimizer = STAC(model, lr=0.1, last_n_layers=1)
+    optimizer = STAC(model, lr=0.1, last_n_modules=1)
     state_dict = deepcopy(optimizer.state_dict())
     state_dict["param_groups"][0]["param_names"] = ("wrong_name",)
 

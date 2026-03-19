@@ -29,7 +29,7 @@ class BenchmarkConfig:
     label: str
     optimizer_kind: str
     lr: float = 2e-3
-    last_n_layers: int = 1
+    last_n_modules: int = 1
     sign_momentum: float = 0.9
     weight_decay: float = 1e-2
     color: str = "#1f77b4"
@@ -223,7 +223,7 @@ def build_optimizer(
         return STAC(
             model,
             lr=config.lr,
-            last_n_layers=config.last_n_layers,
+            last_n_modules=config.last_n_modules,
             sign_momentum=config.sign_momentum,
             weight_decay=config.weight_decay,
         )
@@ -655,15 +655,15 @@ def main() -> None:
 
     configs = [
         BenchmarkConfig(
-            label="STAC default (last_n_layers=1)",
+            label="STAC default (last_n_modules=1)",
             optimizer_kind="stac",
             color="#0f766e",
             linestyle="-",
         ),
         BenchmarkConfig(
-            label="STAC wider AdamW section (last_n_layers=2)",
+            label="STAC wider AdamW section (last_n_modules=2)",
             optimizer_kind="stac",
-            last_n_layers=2,
+            last_n_modules=2,
             color="#c2410c",
             linestyle="-.",
         ),

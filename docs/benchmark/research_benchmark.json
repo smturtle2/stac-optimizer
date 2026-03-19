@@ -14,20 +14,20 @@
   },
   "configs": [
     {
-      "label": "STAC default (last_n_layers=1)",
+      "label": "STAC default (last_n_modules=1)",
       "optimizer_kind": "stac",
       "lr": 0.002,
-      "last_n_layers": 1,
+      "last_n_modules": 1,
       "sign_momentum": 0.9,
       "weight_decay": 0.01,
       "color": "#0f766e",
       "linestyle": "-"
     },
     {
-      "label": "STAC wider AdamW section (last_n_layers=2)",
+      "label": "STAC wider AdamW section (last_n_modules=2)",
       "optimizer_kind": "stac",
       "lr": 0.002,
-      "last_n_layers": 2,
+      "last_n_modules": 2,
       "sign_momentum": 0.9,
       "weight_decay": 0.01,
       "color": "#c2410c",
@@ -37,7 +37,7 @@
       "label": "STAC plain sign update",
       "optimizer_kind": "stac",
       "lr": 0.002,
-      "last_n_layers": 1,
+      "last_n_modules": 1,
       "sign_momentum": 0.0,
       "weight_decay": 0.01,
       "color": "#9333ea",
@@ -47,7 +47,7 @@
       "label": "AdamW baseline",
       "optimizer_kind": "adamw",
       "lr": 0.002,
-      "last_n_layers": 1,
+      "last_n_modules": 1,
       "sign_momentum": 0.9,
       "weight_decay": 0.01,
       "color": "#1d4ed8",
@@ -66,12 +66,12 @@
         "epochs": 12
       },
       "configs": {
-        "STAC default (last_n_layers=1)": {
+        "STAC default (last_n_modules=1)": {
           "config": {
-            "label": "STAC default (last_n_layers=1)",
+            "label": "STAC default (last_n_modules=1)",
             "optimizer_kind": "stac",
             "lr": 0.002,
-            "last_n_layers": 1,
+            "last_n_modules": 1,
             "sign_momentum": 0.9,
             "weight_decay": 0.01,
             "color": "#0f766e",
@@ -80,18 +80,18 @@
           "curves": {
             "train_loss": {
               "mean": [
-                0.05382881075143814,
-                0.04339065432548523,
-                0.040804420337080954,
-                0.039779355116188526,
-                0.038849337585270406,
-                0.03825633086264134,
-                0.037916316390037536,
-                0.03728279680013656,
-                0.0367358972132206,
-                0.03646321032196283,
-                0.03575995437800884,
-                0.03536864222958684
+                0.05601494248956442,
+                0.04385659512132406,
+                0.04105535909533501,
+                0.03988116506487131,
+                0.03894186567515135,
+                0.03830879185348749,
+                0.037993737533688544,
+                0.037307459563016884,
+                0.03676540318876505,
+                0.03653573337942362,
+                0.03581711210310459,
+                0.035459653493016954
               ],
               "min": [
                 0.0522523794323206,
@@ -100,17 +100,17 @@
                 0.039206895418465136,
                 0.038045474141836164,
                 0.03798435088247061,
-                0.03727458920329809,
+                0.037661694921553135,
                 0.03698764871805906,
                 0.035770848765969275,
-                0.03577948622405529,
+                0.036142101511359215,
                 0.03528877440840006,
-                0.033900659531354904
+                0.0343557158485055
               ],
               "max": [
-                0.05626058857887983,
-                0.044068381749093534,
-                0.04140666238963604,
+                0.06719124726951123,
+                0.04592049028724432,
+                0.04192952793091535,
                 0.040557368844747546,
                 0.040092180483043194,
                 0.03857689574360847,
@@ -124,18 +124,18 @@
             },
             "val_loss": {
               "mean": [
-                0.04545806348323822,
-                0.04361466243863106,
-                0.042617374658584596,
-                0.04317813068628311,
-                0.04320044368505478,
-                0.04348567947745323,
-                0.04375421330332756,
-                0.044078723341226575,
-                0.044726449996232986,
-                0.044426394253969194,
-                0.045029330998659134,
-                0.045480842143297194
+                0.04649068638682365,
+                0.04385744780302048,
+                0.04281987249851227,
+                0.043376626819372176,
+                0.04348790645599365,
+                0.043801679462194446,
+                0.0439832404255867,
+                0.04422703981399536,
+                0.045060355216264725,
+                0.04473946765065193,
+                0.04533920362591744,
+                0.04590055122971535
               ],
               "min": [
                 0.043294839560985565,
@@ -152,34 +152,34 @@
                 0.04438552260398865
               ],
               "max": [
-                0.049536239355802536,
-                0.04535970091819763,
-                0.04427854344248772,
+                0.054699353873729706,
+                0.046390265226364136,
+                0.04498506337404251,
                 0.045335691422224045,
-                0.04496133327484131,
+                0.04564794898033142,
                 0.04607049748301506,
-                0.04570113867521286,
+                0.04573764652013779,
                 0.04575715214014053,
                 0.04782230406999588,
-                0.046397771686315536,
-                0.04702158272266388,
+                0.04643302783370018,
+                0.047136884182691574,
                 0.047512322664260864
               ]
             }
           },
           "summary": {
-            "final_train_loss_mean": 0.03536864222958684,
-            "final_val_loss_mean": 0.045480842143297194,
+            "final_train_loss_mean": 0.035459653493016954,
+            "final_val_loss_mean": 0.04590055122971535,
             "final_val_loss_min": 0.04438552260398865,
             "final_val_loss_max": 0.047512322664260864
           }
         },
-        "STAC wider AdamW section (last_n_layers=2)": {
+        "STAC wider AdamW section (last_n_modules=2)": {
           "config": {
-            "label": "STAC wider AdamW section (last_n_layers=2)",
+            "label": "STAC wider AdamW section (last_n_modules=2)",
             "optimizer_kind": "stac",
             "lr": 0.002,
-            "last_n_layers": 2,
+            "last_n_modules": 2,
             "sign_momentum": 0.9,
             "weight_decay": 0.01,
             "color": "#c2410c",
@@ -287,7 +287,7 @@
             "label": "STAC plain sign update",
             "optimizer_kind": "stac",
             "lr": 0.002,
-            "last_n_layers": 1,
+            "last_n_modules": 1,
             "sign_momentum": 0.0,
             "weight_decay": 0.01,
             "color": "#9333ea",
@@ -395,7 +395,7 @@
             "label": "AdamW baseline",
             "optimizer_kind": "adamw",
             "lr": 0.002,
-            "last_n_layers": 1,
+            "last_n_modules": 1,
             "sign_momentum": 0.9,
             "weight_decay": 0.01,
             "color": "#1d4ed8",
@@ -511,12 +511,12 @@
         "epochs": 12
       },
       "configs": {
-        "STAC default (last_n_layers=1)": {
+        "STAC default (last_n_modules=1)": {
           "config": {
-            "label": "STAC default (last_n_layers=1)",
+            "label": "STAC default (last_n_modules=1)",
             "optimizer_kind": "stac",
             "lr": 0.002,
-            "last_n_layers": 1,
+            "last_n_modules": 1,
             "sign_momentum": 0.9,
             "weight_decay": 0.01,
             "color": "#0f766e",
@@ -666,12 +666,12 @@
             "final_val_accuracy_max": 0.90625
           }
         },
-        "STAC wider AdamW section (last_n_layers=2)": {
+        "STAC wider AdamW section (last_n_modules=2)": {
           "config": {
-            "label": "STAC wider AdamW section (last_n_layers=2)",
+            "label": "STAC wider AdamW section (last_n_modules=2)",
             "optimizer_kind": "stac",
             "lr": 0.002,
-            "last_n_layers": 2,
+            "last_n_modules": 2,
             "sign_momentum": 0.9,
             "weight_decay": 0.01,
             "color": "#c2410c",
@@ -826,7 +826,7 @@
             "label": "STAC plain sign update",
             "optimizer_kind": "stac",
             "lr": 0.002,
-            "last_n_layers": 1,
+            "last_n_modules": 1,
             "sign_momentum": 0.0,
             "weight_decay": 0.01,
             "color": "#9333ea",
@@ -981,7 +981,7 @@
             "label": "AdamW baseline",
             "optimizer_kind": "adamw",
             "lr": 0.002,
-            "last_n_layers": 1,
+            "last_n_modules": 1,
             "sign_momentum": 0.9,
             "weight_decay": 0.01,
             "color": "#1d4ed8",
@@ -1136,14 +1136,14 @@
   },
   "memory": [
     {
-      "label": "STAC default (last_n_layers=1)",
+      "label": "STAC default (last_n_modules=1)",
       "optimizer_state_mb": 3.6370315551757812,
       "peak_allocated_mb": 31.9248046875,
       "peak_reserved_mb": 38.0,
       "steady_allocated_mb": 28.29736328125
     },
     {
-      "label": "STAC wider AdamW section (last_n_layers=2)",
+      "label": "STAC wider AdamW section (last_n_modules=2)",
       "optimizer_state_mb": 3.7622833251953125,
       "peak_allocated_mb": 31.673828125,
       "peak_reserved_mb": 38.0,

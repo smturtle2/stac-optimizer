@@ -187,7 +187,7 @@ def _make_optimizer(
         return STAC(
             model,
             lr=2e-3,
-            last_n_layers=1,
+            last_n_modules=1,
             sign_momentum=0.9,
             sign_state_dtype=sign_state_dtype,
             weight_decay=1e-2,
@@ -341,7 +341,7 @@ def test_stac_uses_less_optimizer_state_than_adamw_on_cuda(
     stac_optimizer = STAC(
         stac_model,
         lr=2e-3,
-        last_n_layers=1,
+        last_n_modules=1,
         sign_momentum=0.9,
         weight_decay=1e-2,
     )
@@ -381,14 +381,14 @@ def test_bfloat16_sign_state_reduces_sign_optimizer_memory_on_cuda(
     fp32_optimizer = STAC(
         fp32_model,
         lr=2e-3,
-        last_n_layers=0,
+        last_n_modules=0,
         sign_momentum=0.9,
         weight_decay=1e-2,
     )
     bf16_optimizer = STAC(
         bf16_model,
         lr=2e-3,
-        last_n_layers=0,
+        last_n_modules=0,
         sign_momentum=0.9,
         sign_state_dtype=torch.bfloat16,
         weight_decay=1e-2,
