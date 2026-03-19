@@ -9,7 +9,23 @@ module은 AdamW로 두고, 그보다 앞선 trainable module은 plain signSGD로
 업데이트합니다. sign trunk는 의도적으로 momentum이 없고 sign 쪽 optimizer
 state도 만들지 않습니다.
 
-![STAC optimizer flowchart](../assets/stac-flow.svg)
+```mermaid
+flowchart LR
+    A["model.named_modules 순서"]
+    A --> B["직접 trainable parameter를 가진 module만 집계"]
+    B --> C["앞쪽 module"]
+    B --> D["마지막 N개 module"]
+    C --> E["sign trunk<br/>decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>momentum 없음<br/>sign-side state 없음"]
+    D --> F["AdamW cap<br/>decoupled weight decay<br/>exp_avg + exp_avg_sq"]
+
+    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
+    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
+    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
+
+    class A,B neutral;
+    class C,E sign;
+    class D,F adam;
+```
 
 ## 업데이트 규칙
 

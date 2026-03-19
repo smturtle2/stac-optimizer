@@ -26,7 +26,22 @@ VRAM을 크게 줄이면서 tail 구간의 adaptivity는 유지합니다.
 
 ## 흐름
 
-![STAC optimizer flowchart](docs/assets/stac-flow.svg)
+```mermaid
+flowchart LR
+    A["등록 순서의 trainable module"]
+    A --> B["Sign trunk"]
+    A --> C["AdamW cap"]
+    B --> D["앞쪽 module<br/>decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>momentum 없음<br/>sign-side state 없음"]
+    C --> E["마지막 N개 trainable module<br/>표준 AdamW<br/>exp_avg + exp_avg_sq"]
+
+    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
+    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
+    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
+
+    class A neutral;
+    class B,D sign;
+    class C,E adam;
+```
 
 ## 설치
 

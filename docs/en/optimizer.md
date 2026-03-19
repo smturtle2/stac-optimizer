@@ -8,7 +8,23 @@ STAC means "SignSGD Trunk, AdamW Cap". It keeps the final `N` trainable
 modules on AdamW and the earlier trainable modules on plain signSGD. The sign
 trunk is intentionally momentum-free and sign-state-free.
 
-![STAC optimizer flowchart](../assets/stac-flow.svg)
+```mermaid
+flowchart LR
+    A["model.named_modules order"]
+    A --> B["direct trainable modules only"]
+    B --> C["earlier modules"]
+    B --> D["last N modules"]
+    C --> E["sign trunk<br/>decoupled weight decay<br/>parameter -= lr * sign(grad)<br/>no momentum<br/>no sign-side state"]
+    D --> F["AdamW cap<br/>decoupled weight decay<br/>exp_avg + exp_avg_sq"]
+
+    classDef neutral fill:#f8fafc,stroke:#475569,color:#0f172a,stroke-width:1px;
+    classDef sign fill:#d7f0e8,stroke:#0f766e,color:#134e4a,stroke-width:1.5px;
+    classDef adam fill:#dbeafe,stroke:#2563eb,color:#1d4ed8,stroke-width:1.5px;
+
+    class A,B neutral;
+    class C,E sign;
+    class D,F adam;
+```
 
 ## Update Rules
 
