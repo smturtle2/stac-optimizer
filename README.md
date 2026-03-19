@@ -28,7 +28,7 @@ preserving strong optimization behavior where adaptive updates matter most.
 flowchart LR
     A[Trainable layers in registration order] --> B[Earlier trainable layers]
     A --> C[Last N trainable layers]
-    B --> D[Sign-updated section<br/>decoupled weight decay<br/>EMA(grad) -> sign update<br/>optional bf16 state]
+    B --> D[Sign-updated section<br/>decoupled weight decay<br/>EMA grad then sign update<br/>optional bf16 state]
     C --> E[AdamW section<br/>decoupled weight decay]
 ```
 

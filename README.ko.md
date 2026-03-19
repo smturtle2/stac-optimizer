@@ -23,7 +23,7 @@ AdamW로 돌릴 때보다 optimizer state VRAM을 줄이면서도, 적응형 업
 flowchart LR
     A[등록 순서의 학습 레이어] --> B[앞쪽 학습 레이어]
     A --> C[마지막 N개 학습 레이어]
-    B --> D[sign 업데이트 구간<br/>decoupled weight decay<br/>EMA(grad) -> sign update<br/>optional bf16 state]
+    B --> D[sign 업데이트 구간<br/>decoupled weight decay<br/>EMA grad 후 sign update<br/>optional bf16 state]
     C --> E[AdamW 구간<br/>decoupled weight decay]
 ```
 
